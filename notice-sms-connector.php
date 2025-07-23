@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: Notice SMS Notifications
+ * Plugin Name: Notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
  * Version:     3.4
- * Author:      Constantin
+ * Author:      Notice.ro
  */
 
 if (! defined('ABSPATH')) {
@@ -178,7 +178,7 @@ function sawp_render_settings_page()
     ?>
     <div class="wrap">
         <div class="sawp-header">
-            <h1>SMS Auto Woo PRO</h1>
+            <h1>Notificari automate ce iti optimizeaza costurile</h1>
             <a href="https://notice.ro/" target="_blank">
                 <img src="https://notice.ro/wp-content/uploads/2023/11/logo-color-icon.png" alt="Notice">
             </a>
