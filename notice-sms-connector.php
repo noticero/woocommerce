@@ -178,7 +178,7 @@ function sawp_render_settings_page()
     ?>
     <div class="wrap">
         <div class="sawp-header">
-            <h1>SMS Auto Woo PRO</h1>
+            <h1>Notice SMS Notifications</h1>
             <a href="https://notice.ro/" target="_blank">
                 <img src="https://notice.ro/wp-content/uploads/2023/11/logo-color-icon.png" alt="Notice">
             </a>
