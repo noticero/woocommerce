@@ -2,13 +2,13 @@
 /**
  * Plugin Name: notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     3.3
+ * Version:     3.4
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
 if (!defined('ABSPATH')) { exit; }
 global $wpdb;
-$SAWP_LOG_TABLE = $wpdb->prefix . 'sawp_sms_logs';
+ $SAWP_LOG_TABLE = $wpdb->prefix . 'sawp_sms_logs';
 
 // Înregistrează statusul "Plată în așteptare" în WooCommerce
 add_action('init', 'sawp_register_payment_pending_status');
@@ -21,12 +21,23 @@ function sawp_register_payment_pending_status() {
         'show_in_admin_status_list' => true,
         'label_count'               => _n_noop('Plată în așteptare (%s)', 'Plată în așteptare (%s)', 'notice-sms-connector')
     ));
+    
+    // Înregistrează statusul "Plată cu cardul efectuată"
+    register_post_status('wc-card-paid', array(
+        'label'                     => _x('Plată cu cardul efectuată', 'Order status', 'notice-sms-connector'),
+        'public'                    => true,
+        'exclude_from_search'       => false,
+        'show_in_admin_all_list'    => true,
+        'show_in_admin_status_list' => true,
+        'label_count'               => _n_noop('Plată cu cardul efectuată (%s)', 'Plată cu cardul efectuată (%s)', 'notice-sms-connector')
+    ));
 }
 
-// Adaugă statusul la lista de statusuri disponibile
-add_filter('wc_order_statuses', 'sawp_add_payment_pending_to_list');
-function sawp_add_payment_pending_to_list($order_statuses) {
+// Adaugă statusurile la lista de statusuri disponibile
+add_filter('wc_order_statuses', 'sawp_add_custom_statuses_to_list');
+function sawp_add_custom_statuses_to_list($order_statuses) {
     $order_statuses['wc-payment-pending'] = _x('Plată în așteptare', 'Order status', 'notice-sms-connector');
+    $order_statuses['wc-card-paid'] = _x('Plată cu cardul efectuată', 'Order status', 'notice-sms-connector');
     return $order_statuses;
 }
 
@@ -202,6 +213,9 @@ function sawp_init() {
     
     // Adaugă verificare la schimbarea token-ului
     add_action('update_option_sawp_opts', 'sawp_check_token_change', 10, 2);
+    
+    // Adaugă acțiunea pentru detectarea AWB-ului
+    add_action('updated_post_meta', 'sawp_detect_awb_from_colete_online', 10, 4);
 }
 function sawp_notice_wc_missing() {
     echo '<div class="notice notice-error"><p><strong>notice.ro</strong> necesită WooCommerce activ.</p></div>';
@@ -264,6 +278,17 @@ function sawp_register_settings() {
         'sawp_main',
         ['slug' => $slug, 'label' => 'Plată în așteptare', 'is_payment_pending' => true]
     );
+    
+    // „Plată cu cardul efectuată” (card-paid)
+    $slug = 'card-paid';
+    add_settings_field(
+        "sawp_status_{$slug}",
+        '<span class="dashicons dashicons-yes"></span> Trimite SMS la Plată cu cardul efectuată',
+        'sawp_field_status_row',
+        'sawp-settings',
+        'sawp_main',
+        ['slug' => $slug, 'label' => 'Plată cu cardul efectuată', 'is_card_paid' => true]
+    );
 }
 // Funcție de sanitizare a opțiunilor
 function sawp_sanitize_options($input) {
@@ -287,6 +312,7 @@ function sawp_sanitize_options($input) {
     }
     $statuses[] = 'pending'; // Adăugăm pending separat
     $statuses[] = 'payment-pending'; // Adăugăm payment-pending separat
+    $statuses[] = 'card-paid'; // Adăugăm card-paid separat
     
     foreach ($statuses as $slug) {
         // Enable checkbox
@@ -310,6 +336,7 @@ function sawp_field_status_row( $args ) {
     $slug       = isset($args['slug']) ? (string) $args['slug'] : '';
     $is_pending = ! empty( $args['is_pending'] );
     $is_payment_pending = ! empty( $args['is_payment_pending'] );
+    $is_card_paid = ! empty( $args['is_card_paid'] );
     $opts    = get_option( 'sawp_opts', [] );
     $enabled = ! empty( $opts[ "enable_{$slug}" ] );
     $sel     = isset( $opts[ "tpl_{$slug}" ] ) ? (string) $opts[ "tpl_{$slug}" ] : '';
@@ -361,6 +388,9 @@ function sawp_field_status_row( $args ) {
             <?php endif; ?>
             <?php if ($is_payment_pending): ?>
                 <span class="sawp-pending-note">(Plată neconfirmată)</span>
+            <?php endif; ?>
+            <?php if ($is_card_paid): ?>
+                <span class="sawp-pending-note">(Plată cu cardul)</span>
             <?php endif; ?>
         </div>
         
@@ -2327,6 +2357,232 @@ CSS;
     
     wp_add_inline_style('sawp-admin-styles', $css);
 }
+/* ================== DETECTARE AWB DIN COLETE ONLINE ================== */
+// Funcție helper care returnează AWB-ul sau fallback
+function sawp_get_order_awb( $order ) {
+    if ( ! $order instanceof WC_Order ) {
+        return 'în curs de generare';
+    }
+
+    // întâi verificăm dacă avem AWB normalizat
+    $awb = $order->get_meta('_notice_awb');
+    if ($awb) return $awb;
+
+    // fallback: căutăm în câteva chei cunoscute
+    $candidates = [
+        'awb_cargus',
+        '_tracking_number',
+        'awb',
+        '_awb',
+        'awb_number',
+        '_awb_number',
+        'coleteonline_awb',
+        '_coleteonline_awb',
+        'coleteonline_tracking_number',
+        '_coleteonline_tracking_number',
+        'coleteonline_courier_awb',
+        '_coleteonline_courier_awb',
+    ];
+    foreach ($candidates as $key) {
+        $val = $order->get_meta($key);
+        if (is_string($val) && $val !== '') {
+            return trim($val);
+        }
+    }
+
+    // fallback: căutare "fuzzy" în toate metadatele
+    foreach ($order->get_meta_data() as $meta) {
+        $mkey = (string) $meta->key;
+        $mval = $meta->value;
+        if (stripos($mkey,'colete') !== false && (stripos($mkey,'awb') !== false || stripos($mkey,'track') !== false)) {
+            if (is_string($mval) && $mval !== '') {
+                return trim($mval);
+            }
+            if (is_array($mval) && !empty($mval['awb'])) {
+                return trim((string)$mval['awb']);
+            }
+        }
+    }
+
+    // fallback: WooCommerce Shipment Tracking
+    $sti = $order->get_meta('_wc_shipment_tracking_items');
+    if (is_array($sti) && !empty($sti)) {
+        foreach ($sti as $item) {
+            if (!empty($item['tracking_number'])) {
+                return trim((string)$item['tracking_number']);
+            }
+        }
+    }
+
+    // fallback final
+    return 'în curs de generare';
+}
+
+// Detectează și salvează AWB când pluginul Colete-Online îl scrie în meta
+function sawp_detect_awb_from_colete_online($meta_id, $post_id, $meta_key, $meta_value){
+    if (get_post_type($post_id) !== 'shop_order') return;
+
+    $key_l = strtolower((string)$meta_key);
+    if (strpos($key_l,'colete') === false) return;
+    if (strpos($key_l,'awb') === false && strpos($key_l,'track') === false) return;
+
+    $order = wc_get_order($post_id);
+    if (!$order) return;
+
+    // dacă deja avem un AWB salvat, nu mai suprascriem
+    $already = $order->get_meta('_notice_awb');
+    if (!empty($already)) return;
+
+    $awb = '';
+    if (is_string($meta_value) && $meta_value !== '') {
+        $awb = trim($meta_value);
+    } elseif (is_array($meta_value)) {
+        if (!empty($meta_value['awb'])) $awb = trim((string)$meta_value['awb']);
+        elseif (!empty($meta_value['tracking_number'])) $awb = trim((string)$meta_value['tracking_number']);
+    }
+
+    if ($awb === '') return;
+
+    $order->update_meta_data('_notice_awb', $awb);
+    $order->save();
+}
+
+// Adăugăm o acțiune pentru a salva AWB-ul detectat
+add_action('wp_ajax_save_coleteonline_awb', 'sawp_save_coleteonline_awb');
+function sawp_save_coleteonline_awb() {
+    check_ajax_referer('save_awb_nonce', 'nonce');
+    
+    if (!current_user_can('edit_shop_orders')) {
+        wp_send_json_error('Permission denied');
+    }
+    
+    $order_id = intval($_POST['order_id']);
+    $awb = sanitize_text_field($_POST['awb']);
+    
+    if (empty($order_id) || empty($awb)) {
+        wp_send_json_error('Missing data');
+    }
+    
+    $order = wc_get_order($order_id);
+    if (!$order) {
+        wp_send_json_error('Order not found');
+    }
+    
+    // Salvăm AWB-ul
+    $order->update_meta_data('_notice_awb', $awb);
+    $order->save();
+    
+    wp_send_json_success(array('awb' => $awb));
+}
+
+// Adăugăm script pentru a detecta AWB-ul din DOM
+add_action('admin_footer', 'sawp_add_coleteonline_awb_detection_script');
+function sawp_add_coleteonline_awb_detection_script() {
+    global $post;
+    
+    // Verificăm dacă suntem pe pagina de editare a unei comenzi
+    if (!$post || get_post_type($post) !== 'shop_order') {
+        return;
+    }
+    
+    ?>
+    <script>
+    jQuery(document).ready(function($) {
+        // Funcție pentru a extrage AWB-ul din DOM
+        function extractAWBFromDOM() {
+            var $awbElement = $('.coleteonline-courier-awb');
+            if ($awbElement.length) {
+                return $awbElement.text().trim();
+            }
+            return null;
+        }
+        
+        // Funcție pentru a salva AWB-ul
+        function saveAWB(awb) {
+            if (!awb) return;
+            
+            var orderId = $('#post_ID').val();
+            if (!orderId) return;
+            
+            $.post(ajaxurl, {
+                action: 'save_coleteonline_awb',
+                order_id: orderId,
+                awb: awb,
+                nonce: '<?php echo wp_create_nonce('save_awb_nonce'); ?>'
+            }, function(response) {
+                if (response.success) {
+                    console.log('AWB salvat:', response.data.awb);
+                } else {
+                    console.log('Eroare la salvarea AWB:', response.data);
+                }
+            });
+        }
+        
+        // Verificăm periodic dacă există AWB în DOM
+        var checkInterval = setInterval(function() {
+            var awb = extractAWBFromDOM();
+            if (awb) {
+                saveAWB(awb);
+                // Oprim verificarea după ce am găsit AWB-ul
+                clearInterval(checkInterval);
+            }
+        }, 1000);
+        
+        // Verificăm și la click pe butonul de download
+        $(document).on('click', '.coleteonline-do-download-awb', function() {
+            // Așteptăm puțin pentru a permite actualizarea DOM-ului
+            setTimeout(function() {
+                var awb = extractAWBFromDOM();
+                if (awb) {
+                    saveAWB(awb);
+                } else {
+                    // Dacă nu găsim AWB-ul imediat, încercăm din nou după 2 secunde
+                    setTimeout(function() {
+                        var awb = extractAWBFromDOM();
+                        if (awb) {
+                            saveAWB(awb);
+                        }
+                    }, 2000);
+                }
+            }, 500);
+        });
+        
+        // Verificăm și la schimbarea statusului comenzii
+        $(document).on('change', '#order_status', function() {
+            setTimeout(function() {
+                var awb = extractAWBFromDOM();
+                if (awb) {
+                    saveAWB(awb);
+                }
+            }, 1000);
+        });
+    });
+    </script>
+    <?php
+}
+
+// Adăugăm un buton manual pentru a extrage AWB-ul
+add_action('woocommerce_order_actions', 'sawp_add_extract_awb_action');
+function sawp_add_extract_awb_action($actions) {
+    $actions['extract_awb'] = __('Extrage AWB', 'notice-sms-connector');
+    return $actions;
+}
+
+// Procesăm acțiunea de extragere AWB
+add_action('woocommerce_order_action_extract_awb', 'sawp_process_extract_awb_action');
+function sawp_process_extract_awb_action($order) {
+    $awb = sawp_get_order_awb($order);
+    
+    if ($awb && $awb !== 'în curs de generare') {
+        $order->update_meta_data('_notice_awb', $awb);
+        $order->save();
+        
+        // Adăugăm o notificare
+        wc_add_notice(__('AWB extras cu succes: ', 'notice-sms-connector') . $awb, 'success');
+    } else {
+        wc_add_notice(__('Nu s-a putut extrage AWB-ul. Verificați dacă a fost generat.', 'notice-sms-connector'), 'error');
+    }
+}
 /* ================== TRIMITERE SMS ================== */
 function sawp_send_sms($order_id, $old_status, $new_status, $order) {
     $opts = get_option('sawp_opts', []);
@@ -2336,8 +2592,14 @@ function sawp_send_sms($order_id, $old_status, $new_status, $order) {
     if ($new_status === 'payment-pending') {
         $en = !empty($opts["enable_payment-pending"]);
         $tpl = intval($opts["tpl_payment-pending"] ?? 0);
-    } else {
-        // Pentru toate celelalte statusuri
+    } 
+    // Verifică dacă este statusul "card-paid"
+    elseif ($new_status === 'card-paid') {
+        $en = !empty($opts["enable_card-paid"]);
+        $tpl = intval($opts["tpl_card-paid"] ?? 0);
+    }
+    // Pentru toate celelalte statusuri
+    else {
         $tpl = intval($opts["tpl_{$new_status}"] ?? 0);
         $en = !empty($opts["enable_{$new_status}"]);
     }
@@ -2369,7 +2631,7 @@ function sawp_send_sms($order_id, $old_status, $new_status, $order) {
         'variables' => [
             'order_id' => $order->get_order_number(),
             'total'    => $order->get_total(),
-            'awb'      => $order->get_meta('awb_cargus') ?: $order->get_meta('_tracking_number'),
+            'awb'      => sawp_get_order_awb($order),
             'nume'     => $order->get_billing_first_name(),
         ],
     ];
