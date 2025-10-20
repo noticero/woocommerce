@@ -42,7 +42,8 @@ function sawp_add_custom_statuses_to_list($order_statuses) {
 }
 
 add_action('wp_footer', function(){ if (function_exists('is_checkout') && is_checkout()) echo '<style>#sawp-otp-verify{width:100%!important;display:block!important}</style>'; });
-add_action('wp_footer',function(){ if(function_exists('is_checkout')&&is_checkout()) echo '<style>#place_order,.wc-block-components-checkout-place-order-button{display:none}</style>'; });
+add_action('wp_footer',function(){ if(function_exists('is_checkout')&&is_checkout()){ $o=get_option('sawp_otp_opts',[]); $s=get_option('sawp_opts',[]); $enabled=!empty($o['enabled'])&&!empty($o['template_id'])&&!empty($s['token']); $methods=(isset($o['methods'])&&is_array($o['methods']))?array_values($o['methods']):[]; echo '<script>!function($){var en='.($enabled?'true':'false').', ms='.( $methods?json_encode(array_values($methods)):'[]' ).';function tg(){var m=$(\'input[name=payment_method]:checked\').val()||"";var need=en&&(ms.length?ms.indexOf(m)!==-1:true);var sel="#place_order, .wc-block-components-checkout-place-order-button"; if(need){$(sel).hide();}else{$(sel).show().prop("disabled",false);} }$(document).on("change payment_method_selected updated_checkout",tg);$(tg);} (jQuery);</script>'; }});
+
 
 
 /* ================== ACTIVARE ================== */
