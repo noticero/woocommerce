@@ -2,7 +2,7 @@
 /**
  * Plugin Name: notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     4.0
+ * Version:     3.4
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
@@ -40,170 +40,6 @@ function sawp_add_custom_statuses_to_list($order_statuses) {
     $order_statuses['wc-card-paid'] = _x('Plată cu cardul efectuată', 'Order status', 'notice-sms-connector');
     return $order_statuses;
 }
-
-add_action('wp_footer', function(){ if (function_exists('is_checkout') && is_checkout()) echo '<style>#sawp-otp-verify{width:100%!important;display:block!important}</style>'; });
-
-add_action('wp_footer',function(){ if(function_exists('is_checkout')&&is_checkout()){ $o=get_option('sawp_otp_opts',[]); $s=get_option('sawp_opts',[]); $enabled=!empty($o['enabled'])&&!empty($o['template_id'])&&!empty($s['token']); $methods=(isset($o['methods'])&&is_array($o['methods']))?array_values($o['methods']):[]; echo '<script>!function($){var en='.($enabled?'true':'false').', ms='.( $methods?json_encode(array_values($methods)):'[]' ).';function tg(){var m=$(\'input[name=payment_method]:checked\').val()||"";var need=en&&(ms.length?ms.indexOf(m)!==-1:true);var sel="#place_order, .wc-block-components-checkout-place-order-button"; if(need){$(sel).hide();}else{$(sel).show().prop("disabled",false);} }$(document).on("change payment_method_selected updated_checkout",tg);$(tg);} (jQuery);</script>'; }});
-/* ================== STATUS „CONFIRMATĂ” (MOV) ================== */
-
-/** 1) Înregistrare status nou */
-add_action('init', function () {
-    register_post_status('wc-sms-confirmed', [
-        'label'                     => _x('Confirmată', 'Order status', 'notice-sms-connector'),
-        'public'                    => true,
-        'exclude_from_search'       => false,
-        'show_in_admin_all_list'    => true,
-        'show_in_admin_status_list' => true,
-        'label_count'               => _n_noop('Confirmată (%s)', 'Confirmată (%s)', 'notice-sms-connector'),
-    ]);
-});
-
-/** 2) Afișare în lista de statusuri */
-add_filter('wc_order_statuses', function ($st) {
-    $st['wc-sms-confirmed'] = _x('Confirmată', 'Order status', 'notice-sms-connector');
-    return $st;
-});
-
-/** 3) Badge mov în ecranul Orders */
-add_action('admin_head', function () {
-    echo '<style>
-        .order-status.status-sms-confirmed,
-        mark.order-status.status-sms-confirmed {
-            background:#a855f7!important; color:#fff!important;
-        }
-    </style>';
-});
-
-
-/* ================== LOGICA „DA” → CONFIRMATĂ ================== */
-
-/** Helper: e „da” (cu punctuație/whitespace ignorate, case-insensitive)? */
-if (!function_exists('sawp_is_affirmative_da')) {
-function sawp_is_affirmative_da($text) {
-    $t = wp_strip_all_tags((string)$text);
-    $t = strtolower(trim($t));
-    // elimină punctuație/spații multiple
-    $t = preg_replace('/[^\p{L}\p{N}]+/u', '', $t);
-    return ($t === 'da'); // strict „da”
-}}
-/** Helper: marchează comanda Confirmată dacă e în processing și mesajul e „da” */
-if (!function_exists('sawp_confirm_via_inbound_sms')) {
-function sawp_confirm_via_inbound_sms($raw_phone, $raw_message) {
-    if (!function_exists('wc_get_order')) return;
-
-    // e „da”?
-    if (!sawp_is_affirmative_da($raw_message)) return;
-
-    // găsește comanda după telefonul clientului
-    if (!function_exists('sawp_find_order_by_phone')) return;
-    $order_id = sawp_find_order_by_phone($raw_phone);
-    if (!$order_id) return;
-
-    $order = wc_get_order($order_id);
-    if (!$order) return;
-
-    // doar dacă e în processing
-    if ($order->get_status() !== 'processing') return;
-
-    // dacă e deja confirmată, nu mai face nimic
-    if ($order->get_status() === 'sms-confirmed') return;
-
-    // marchează Confirmată
-    $order->add_order_note(__('Confirmare client prin SMS: „da”. Status setat la „Confirmată”.', 'notice-sms-connector'));
-    $order->update_status('sms-confirmed', '', true);
-}}
-/** Parser robust pentru SMS (reutilizează helperii existenți dacă îi ai deja) */
-if (!function_exists('sawp_pick_phone_from_sms')) {
-function sawp_pick_phone_from_sms($sms) {
-    if (function_exists('sawp_extract_phone_raw'))  return sawp_extract_phone_raw($sms);
-    // fallbackuri comune
-    foreach (['from','sender','phone','number','msisdn','src','originator','mobile'] as $k) {
-        if (!empty($sms[$k])) return (string)$sms[$k];
-    }
-    if (!empty($sms['contact']['phone'])) return (string)$sms['contact']['phone'];
-    return '';
-}}
-if (!function_exists('sawp_pick_message_from_sms')) {
-function sawp_pick_message_from_sms($sms) {
-    if (function_exists('sawp_extract_message')) return sawp_extract_message($sms);
-    foreach (['message','body','text','content','msg','sms'] as $k) {
-        if (!empty($sms[$k])) return (string)$sms[$k];
-    }
-    if (!empty($sms['payload']['message'])) return (string)$sms['payload']['message'];
-    return '';
-}}
-
-
-/* ===== A) Procesează răspunsurile „da” la acțiunea ta existentă de refresh =====
-   (se execută ÎNAINTEA handlerului tău curent care redirecționează)
-*/
-add_action('admin_post_sawp_fetch_received', function () {
-    // încearcă să eviți dublul request: dacă există deja transientul, folosește-l;
-    $cached = get_transient('sawp_received_sms');
-
-    if (is_array($cached) && $cached) {
-        foreach ($cached as $sms) {
-            $phone = sawp_pick_phone_from_sms($sms);
-            $msg   = sawp_pick_message_from_sms($sms);
-            if ($phone && $msg) {
-                sawp_confirm_via_inbound_sms($phone, $msg);
-            }
-        }
-        return; // lasă handlerul tău existent să facă redirect
-    }
-
-    // dacă nu e în cache, facem o citire rapidă din API (nu afectăm fluxul tău)
-    $opts  = get_option('sawp_opts', []);
-    $token = trim($opts['token'] ?? '');
-    if (!$token) return;
-
-    $res = wp_remote_get('https://api.notice.ro/api/v1/sms-in', [
-        'headers' => [
-            'Authorization' => 'Bearer ' . $token,
-            'Content-Type'  => 'application/json',
-            'Accept'        => 'application/json'
-        ],
-        'timeout' => 15
-    ]);
-    if (is_wp_error($res) || (int)wp_remote_retrieve_response_code($res) !== 200) return;
-
-    $body = json_decode(wp_remote_retrieve_body($res), true);
-    $list = [];
-    if (isset($body['data']) && is_array($body['data'])) $list = $body['data'];
-    elseif (is_array($body)) $list = $body;
-
-    foreach ($list as $sms) {
-        $phone = sawp_pick_phone_from_sms($sms);
-        $msg   = sawp_pick_message_from_sms($sms);
-        if ($phone && $msg) {
-            sawp_confirm_via_inbound_sms($phone, $msg);
-        }
-    }
-}, 1); // PRIORITATE 1: rulează înainte de handlerul tău care redirecționează
-
-
-/* ===== B) (Opțional) Endpoint REST pentru webhook Notice =====
-   POST /wp-json/notice/v1/sms-in  cu payload ce conține „from” și „message”
-*/
-add_action('rest_api_init', function () {
-    register_rest_route('notice/v1', '/sms-in', [
-        'methods'  => 'POST',
-        'permission_callback' => '__return_true', // adaugă securizare dacă vrei (secret)
-        'callback' => function (\WP_REST_Request $req) {
-            $data = $req->get_json_params();
-            if (!is_array($data)) $data = [];
-
-            $phone = sawp_pick_phone_from_sms($data);
-            $msg   = sawp_pick_message_from_sms($data);
-
-            if ($phone && $msg) {
-                sawp_confirm_via_inbound_sms($phone, $msg);
-                return new \WP_REST_Response(['ok' => true], 200);
-            }
-            return new \WP_REST_Response(['ok' => false, 'reason' => 'missing phone/message'], 400);
-        }
-    ]);
-});
 
 /* ================== ACTIVARE ================== */
 register_activation_hook(__FILE__, 'sawp_activate');
@@ -389,10 +225,7 @@ function sawp_admin_menu() {
     add_menu_page('notice.ro','notice.ro','manage_options','sawp-settings','sawp_render_settings_page','dashicons-email-alt2',56);
     add_submenu_page('sawp-settings','Confirmări comenzi','Confirmări comenzi','manage_options','sawp-confirmari','sawp_render_confirmations_page');
     add_submenu_page('sawp-settings','SMS-uri primite','SMS-uri primite','manage_options','sawp-received','sawp_render_received_page');
-     /* --- Nou: Setări OTP --- */
-    add_submenu_page('sawp-settings','Setări OTP','Setări OTP','manage_options','sawp-otp','sawp_render_otp_page');
 }
-
 /* ================== SETĂRI ================== */
 function sawp_register_settings() {
     register_setting('sawp_group', 'sawp_opts', 'sawp_sanitize_options');
@@ -1713,14 +1546,14 @@ function sawp_handle_fetch_received() {
     if (!isset($_GET['sawp_fetch_received_nonce']) || !wp_verify_nonce($_GET['sawp_fetch_received_nonce'], 'sawp_fetch_received')) {
         wp_die('Nonce invalid.');
     }
-    
+
     $opts = get_option('sawp_opts', []);
     $token = trim($opts['token'] ?? '');
-    if (!$token) { 
-        wp_safe_redirect(add_query_arg(['page' => 'sawp-received', 'error' => '1'], admin_url('admin.php'))); 
-        exit; 
+    if (!$token) {
+        wp_safe_redirect(add_query_arg(['page' => 'sawp-received', 'error' => '1'], admin_url('admin.php')));
+        exit;
     }
-    
+
     $response = wp_remote_get('https://api.notice.ro/api/v1/sms-in', [
         'headers' => [
             'Authorization' => 'Bearer ' . $token,
@@ -1729,27 +1562,32 @@ function sawp_handle_fetch_received() {
         ],
         'timeout' => 15
     ]);
-    
+
     if (is_wp_error($response)) {
         set_transient('sawp_received_sms', $response, 15 * MINUTE_IN_SECONDS);
     } else {
         $body = json_decode(wp_remote_retrieve_body($response), true);
         $data = [];
-        
+
         // Handle response structure according to API documentation
         if (is_array($body)) {
-            if (isset($body['data']) && is_array($body['data'])) { 
-                $data = $body['data']; 
-            } elseif (isset($body[0])) { 
-                $data = $body; 
+            if (isset($body['data']) && is_array($body['data'])) {
+                $data = $body['data'];
+            } elseif (isset($body[0])) {
+                $data = $body;
             }
         }
-        
+
+        // Process confirmations from incoming SMS
+        if (is_array($data)) {
+            sawp_process_confirmation_sms($data);
+        }
+
         set_transient('sawp_received_sms', $data, 15 * MINUTE_IN_SECONDS);
         set_transient('sawp_received_last_update', time(), 15 * MINUTE_IN_SECONDS);
     }
-    
-    wp_safe_redirect(admin_url('admin.php?page=sawp-received')); 
+
+    wp_safe_redirect(admin_url('admin.php?page=sawp-received'));
     exit;
 }
 /* ================== CÂMPURI SETĂRI SIMPLE ================== */
@@ -2493,7 +2331,6 @@ input:checked + .sawp-slider:before {
     font-size: 16px;
     margin: 0;
 }
-	
 /* Animatie spin */
 .spin {
     animation: spin 1s linear infinite;
@@ -2520,9 +2357,6 @@ input:checked + .sawp-slider:before {
     .sawp-sms-details {
         grid-template-columns: 1fr;
     }
-	
-
-	
 }
 CSS;
     
@@ -2901,444 +2735,19 @@ function sawp_extract_message(array $sms) {
     
     return is_string($raw) ? $raw : '';
 }
-
-
-/* ******************************************************************
- *                      ***  OTP – variantă stabilă ***
- * ******************************************************************/
-
-/* 1) Înregistrăm opțiunile OTP ca să nu mai apară "allowed options list" */
-add_action('admin_init', function () {
-    register_setting('sawp_otp_group', 'sawp_otp_opts', 'sawp_sanitize_otp_opts');
-});
-
-/* 2) Sanitizare opțiuni (inclusiv metodele de plată) */
-if (!function_exists('sawp_sanitize_otp_opts')) {
-function sawp_sanitize_otp_opts($input) {
-    $out = [];
-    $out['enabled']        = !empty($input['enabled']);
-    $out['template_id']    = isset($input['template_id']) ? absint($input['template_id']) : 0;
-    $out['button_text']    = isset($input['button_text']) ? sanitize_text_field($input['button_text']) : 'Trimite SMS pentru comanda';
-    $out['verify_text']    = isset($input['verify_text']) ? sanitize_text_field($input['verify_text']) : 'Verifică codul';
-    $out['placeholder']    = isset($input['placeholder']) ? sanitize_text_field($input['placeholder']) : 'Cod OTP';
-    $out['code_length']    = isset($input['code_length']) ? max(4, min(8, absint($input['code_length']))) : 6;
-    $out['expire_minutes'] = isset($input['expire_minutes']) ? max(1, min(30, absint($input['expire_minutes']))) : 10;
-
-    // Metode de plată
-    $out['methods'] = [];
-    if (!empty($input['methods']) && is_array($input['methods'])) {
-        foreach ($input['methods'] as $m) {
-            $m = sanitize_text_field($m);
-            if ($m !== '') $out['methods'][] = $m;
-        }
-    }
-    return $out;
-}}
-/* 3) Pagina „Setări OTP” (cu încărcare sigură a template-urilor) */
-function sawp_render_otp_page() {
-    $opts = get_option('sawp_opts', []);
-    $otp  = get_option('sawp_otp_opts', []);
-    $tk   = trim($opts['token'] ?? '');
-
-    // templates
-    $tpls = get_transient('sawp_tpl_list');
-    if (!is_array($tpls)) {
-        $tpls = [];
-        if ($tk) {
-            $res = wp_remote_get('https://api.notice.ro/api/v1/templates', [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $tk,
-                    'Content-Type'  => 'application/json',
-                    'Accept'        => 'application/json'
-                ],
-                'timeout' => 15
-            ]);
-            if (!is_wp_error($res) && 200 === (int) wp_remote_retrieve_response_code($res)) {
-                $body = json_decode(wp_remote_retrieve_body($res), true);
-                if (isset($body['data']) && is_array($body['data']))            $tpls = $body['data'];
-                elseif (isset($body['templates']) && is_array($body['templates'])) $tpls = $body['templates'];
-                elseif (is_array($body))                                         $tpls = $body;
-                set_transient('sawp_tpl_list', $tpls, 5 * MINUTE_IN_SECONDS);
-            }
-        }
-    }
-
-    // metode de plată
-    $gateways = [];
-    if (class_exists('WC_Payment_Gateways') && function_exists('WC')) {
-        $gw = WC()->payment_gateways();
-        if ($gw && method_exists($gw, 'payment_gateways')) {
-            foreach ($gw->payment_gateways() as $g) {
-                $gateways[$g->id] = $g->get_title();
-            }
-        }
-    }
-    $chosen = (array)($otp['methods'] ?? []);
-    ?>
-    <div class="wrap">
-        <h1 style="display:flex;align-items:center;gap:10px;"><span class="dashicons dashicons-shield"></span> Setări OTP</h1>
-        <form method="post" action="options.php" style="max-width:800px;margin-top:20px;">
-            <?php settings_fields('sawp_otp_group'); ?>
-            <table class="form-table">
-                <tr>
-                    <th scope="row">Activează OTP la checkout</th>
-                    <td>
-                        <label>
-                            <input type="checkbox" name="sawp_otp_opts[enabled]" <?php checked(!empty($otp['enabled']), true); ?>>
-                            <span>Solicită codul primit prin SMS înainte de plată</span>
-                        </label>
-                        <?php if (!$tk): ?>
-                            <p class="description" style="color:#d63638;">Setează întâi Token API în „Setări SMS”.</p>
-                        <?php endif; ?>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Template OTP (Notice.ro)</th>
-                    <td>
-                        <select name="sawp_otp_opts[template_id]" style="min-width:320px;">
-                            <option value="">— alege template —</option>
-                            <?php foreach ($tpls as $t):
-                                $id   = (int)($t['id'] ?? 0);
-                                $name = $t['name'] ?? ('['.$id.']'); ?>
-                                <option value="<?php echo esc_attr($id); ?>" <?php selected($id, (int)($otp['template_id'] ?? 0)); ?>>
-                                    [<?php echo esc_html($id); ?>] <?php echo esc_html($name); ?>
-                                </option>
-                            <?php endforeach; ?>
-                        </select>
-                        <p class="description">Exemplu: <code>Codul tău este {{otp_code}}</code></p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Text buton trimitere SMS</th>
-                    <td><input type="text" name="sawp_otp_opts[button_text]" value="<?php echo esc_attr($otp['button_text'] ?? 'Trimite SMS pentru comanda'); ?>" class="regular-text"></td>
-                </tr>
-                <tr>
-                    <th scope="row">Text buton verificare</th>
-                    <td><input type="text" name="sawp_otp_opts[verify_text]" value="<?php echo esc_attr($otp['verify_text'] ?? 'Verifică codul'); ?>" class="regular-text"></td>
-                </tr>
-                <tr>
-                    <th scope="row">Placeholder câmp cod</th>
-                    <td><input type="text" name="sawp_otp_opts[placeholder]" value="<?php echo esc_attr($otp['placeholder'] ?? 'Cod OTP'); ?>" class="regular-text"></td>
-                </tr>
-                <tr>
-                    <th scope="row">Lungime cod</th>
-                    <td><input type="number" min="4" max="8" name="sawp_otp_opts[code_length]" value="<?php echo esc_attr($otp['code_length'] ?? 6); ?>" style="width:90px;"> cifre</td>
-                </tr>
-                <tr>
-                    <th scope="row">Expiră în</th>
-                    <td><input type="number" min="1" max="30" name="sawp_otp_opts[expire_minutes]" value="<?php echo esc_attr($otp['expire_minutes'] ?? 10); ?>" style="width:90px;"> minute</td>
-                </tr>
-                <tr>
-                    <th scope="row">Activează pentru metode</th>
-                    <td>
-                        <?php if ($gateways): foreach ($gateways as $gid => $gname): ?>
-                            <label style="display:block;margin-bottom:4px;">
-                                <input type="checkbox" name="sawp_otp_opts[methods][]" value="<?php echo esc_attr($gid); ?>" <?php checked(in_array($gid, $chosen, true)); ?>>
-                                <?php echo esc_html($gname . ' ['.$gid.']'); ?>
-                            </label>
-                        <?php endforeach; else: ?>
-                            <em>Nu am găsit metode de plată.</em>
-                        <?php endif; ?>
-                        <p class="description">OTP e cerut doar pentru metodele bifate.</p>
-                    </td>
-                </tr>
-            </table>
-            <?php submit_button('Salvează setările OTP'); ?>
-        </form>
-    </div>
-    <?php
-}
-
-/* 4) UI + Logica front – fără interceptarea click-ului pe buton */
-add_action('wp_enqueue_scripts', function () {
-    if (!is_checkout()) return;
-    $otp  = get_option('sawp_otp_opts', []);
-    $opts = get_option('sawp_opts', []);
-    if (empty($otp['enabled']) || empty($otp['template_id']) || empty($opts['token'])) return;
-
-    wp_enqueue_script('jquery');
-    $methods = (array)($otp['methods'] ?? []);
-
-    $data = [
-        'ajaxurl'        => admin_url('admin-ajax.php'),
-        'nonce_send'     => wp_create_nonce('sawp_send_otp'),
-        'nonce_verify'   => wp_create_nonce('sawp_verify_otp'),
-        'buttonText'     => $otp['button_text'] ?? 'Trimite SMS pentru comanda',
-        'verifyText'     => $otp['verify_text'] ?? 'Verifică codul',
-        'placeholder'    => $otp['placeholder'] ?? 'Cod OTP',
-        'allowedMethods' => array_values($methods),
-        'messages'       => [
-            'sent'      => 'SMS cu codul a fost trimis.',
-            'sending'   => 'Se trimite SMS...',
-            'invalid'   => 'Cod OTP invalid sau expirat.',
-            'verified'  => 'Cod verificat. Puteți finaliza plata.',
-            'enterCode' => 'Introduceți codul primit prin SMS.',
-            'needPhone' => 'Completați numărul de telefon.',
-        ],
-    ];
-    wp_add_inline_script('jquery', 'window.SAWP_OTP = '. wp_json_encode($data) .';', 'before');
-
-    $inline = <<<JS
-jQuery(function($){
-  var cfg = window.SAWP_OTP || {};
-  var state = { sent:false, verified:false, originalText:null };
-
-  function btn(){
-    // clasice + blocks
-    var b = $('#place_order');
-    if (b.length) return b;
-    b = $('.wc-block-components-checkout-place-order-button, button.wc-block-components-button__button.wc-block-components-checkout-place-order-button');
-    if (b.length) return b.first();
-    b = $('button[name="woocommerce_checkout_place_order"]');
-    return b.first();
-  }
-
-  function getMethod(){
-    var el = $('input[name="payment_method"]:checked');
-    return el.length ? el.val() : '';
-  }
-
-  function shouldGate(){
-    var allowed = cfg.allowedMethods || [];
-    var current = getMethod();
-    if (!allowed.length) return true; // dacă nu e nimic bifat, aplică tuturor
-    return allowed.indexOf(current) !== -1;
-  }
-
-  function getPhone(){
-    var p = $('#billing_phone');
-    return p.length ? p.val() : '';
-  }
-
-  function ensureOtpBox(){
-    var box = $('#sawp-otp-box');
-    if (box.length) return box;
-    box = $('<div id="sawp-otp-box" style="margin:12px 0;padding:10px;border:1px solid #e5e7eb;border-radius:6px;display:none;"></div>');
-    var row = $('<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;"></div>');
-    var send = $('<button type="button" id="sawp-otp-send" class="button"></button>').text(cfg.buttonText||'Trimite SMS pentru comanda');
-    var input = $('<input type="text" id="sawp-otp-input" placeholder="'+(cfg.placeholder||'Cod OTP')+'" maxlength="8" style="flex:1;min-width:160px;padding:8px;border:1px solid #d1d5db;border-radius:6px;">');
-    var verify = $('<button type="button" id="sawp-otp-verify" class="button button-primary"></button>').text(cfg.verifyText||'Verifică codul');
-    var note = $('<div id="sawp-otp-note" style="margin-top:6px;font-size:12px;color:#6b7280;"></div>');
-    row.append(send).append(input).append(verify);
-    var placeWrap = $('.place-order, .wc-block-components-checkout-place-order').first();
-    if (placeWrap.length) placeWrap.before(box);
-    else btn().closest('div').before(box);
-    box.append(row).append(note);
-    return box;
-  }
-
-  function setButtonDisabled(disabled, newText){
-    var b = btn();
-    if (!b.length) return;
-    if (state.originalText === null) state.originalText = b.text();
-    if (disabled){
-      b.prop('disabled', true).addClass('sawp-otp-disabled');
-      if (newText) b.text(newText);
-    } else {
-      b.prop('disabled', false).removeClass('sawp-otp-disabled');
-      b.text(state.originalText || 'Plasează comanda');
-    }
-  }
-
-  function refresh(){
-    if (shouldGate()){
-      ensureOtpBox().show();
-      if (!state.verified){
-        setButtonDisabled(true, cfg.buttonText || 'Trimite SMS pentru comanda');
-      } else {
-        setButtonDisabled(false);
-        $('#sawp-otp-note').css('color','#059669').text(cfg.messages?.verified || 'Cod verificat.');
-      }
-    } else {
-      ensureOtpBox().hide();
-      setButtonDisabled(false);
-    }
-  }
-
-  // Trimite SMS
-  $(document).on('click', '#sawp-otp-send', function(){
-    var phone = (getPhone()||'').replace(/\\D+/g,'');
-    if (!phone){
-      $('#sawp-otp-note').css('color','#d14343').text(cfg.messages?.needPhone || 'Completați numărul de telefon.');
-      return;
-    }
-    $('#sawp-otp-note').css('color','#6b7280').text(cfg.messages?.sending || 'Se trimite SMS...');
-    $.post(cfg.ajaxurl, { action:'sawp_send_otp', nonce:cfg.nonce_send, phone:phone }, function(res){
-      if (res && res.success){
-        state.sent = true;
-        $('#sawp-otp-note').css('color','#059669').text(cfg.messages?.sent || 'SMS trimis.');
-      } else {
-        state.sent = false;
-        $('#sawp-otp-note').css('color','#d14343').text((res && res.data) ? res.data : 'Eroare la trimiterea SMS-ului');
-      }
-    });
-  });
-
-  // Verifică cod
-  $(document).on('click', '#sawp-otp-verify', function(){
-    var code = ($('#sawp-otp-input').val()||'').trim();
-    if (!code){
-      $('#sawp-otp-note').css('color','#d14343').text(cfg.messages?.enterCode || 'Introduceți codul.');
-      return;
-    }
-    $.post(cfg.ajaxurl, { action:'sawp_verify_otp', nonce:cfg.nonce_verify, code:code }, function(res){
-      if (res && res.success){
-        jQuery('#place_order, .wc-block-components-checkout-place-order-button').show().prop('disabled',false);
-
-		state.verified = true;
-        setButtonDisabled(false);
-        $('#sawp-otp-note').css('color','#059669').text(cfg.messages?.verified || 'Cod verificat.');
-      } else {
-        state.verified = false;
-        setButtonDisabled(true, cfg.buttonText || 'Trimite SMS pentru comanda');
-        $('#sawp-otp-note').css('color','#d14343').text(cfg.messages?.invalid || 'Cod invalid');
-      }
-    });
-  });
-
-  // Reacționează la schimbări de checkout/metodă
-  $(document.body).on('updated_checkout payment_method_selected change', function(){
-    refresh();
-  });
-
-  // init
-  ensureOtpBox();
-  refresh();
-});
-JS;
-    wp_add_inline_script('jquery', $inline);
-
-    // un pic de CSS ca disabled să fie clar
-    $css = <<<CSS
-.sawp-otp-disabled { opacity: .6; pointer-events: none; }
-CSS;
-    wp_add_inline_style('woocommerce-inline', $css);
-});
-
-/* 5) Fallback render (doar pentru a avea un anchor în DOM dacă e nevoie) */
-add_action('woocommerce_review_order_before_submit', function () {
-    $otp  = get_option('sawp_otp_opts', []);
-    $opts = get_option('sawp_opts', []);
-    if (empty($otp['enabled']) || empty($otp['template_id']) || empty($opts['token'])) return;
-    echo '<div id="sawp-otp-box-server" style="display:none;"></div>';
-}, 5);
-
-/* 6) AJAX: send OTP */
-add_action('wp_ajax_sawp_send_otp', 'sawp_send_otp_handler');
-add_action('wp_ajax_nopriv_sawp_send_otp', 'sawp_send_otp_handler');
-function sawp_send_otp_handler() {
-    check_ajax_referer('sawp_send_otp', 'nonce');
-
-    $otp   = get_option('sawp_otp_opts', []);
-    $opts  = get_option('sawp_opts', []);
-    $token = trim($opts['token'] ?? '');
-    $tpl   = absint($otp['template_id'] ?? 0);
-
-    if (empty($otp['enabled']) || !$tpl || !$token) wp_send_json_error('OTP dezactivat sau configurare incompletă.');
-
-    $phone = isset($_POST['phone']) ? preg_replace('/\D+/', '', (string)$_POST['phone']) : '';
-    if (!$phone) wp_send_json_error('Telefon invalid.');
-
-    $len  = max(4, min(8, absint($otp['code_length'] ?? 6)));
-    $code = '';
-    for ($i=0; $i<$len; $i++) { $code .= wp_rand(0,9); }
-
-    if (!WC()->session) { WC()->initialize_session(); }
-    WC()->session->set('sawp_otp', [
-        'code'     => $code,
-        'phone'    => $phone,
-        'created'  => time(),
-        'expires'  => time() + (max(1, (int)($otp['expire_minutes'] ?? 10)) * 60),
-        'verified' => false,
-    ]);
-
-    $resp = wp_remote_post('https://api.notice.ro/api/v1/sms-out', [
-        'headers' => [ 'Authorization' => 'Bearer ' . $token, 'Content-Type' => 'application/json' ],
-        'body'    => wp_json_encode([
-            'number'      => $phone,
-            'template_id' => $tpl,
-            'variables'   => [ 'otp_code' => $code ],
-        ]),
-        'timeout' => 20,
-    ]);
-    if (is_wp_error($resp)) wp_send_json_error($resp->get_error_message());
-    if ((int)wp_remote_retrieve_response_code($resp) !== 200) wp_send_json_error('Eroare API Notice.');
-
-    wp_send_json_success(true);
-}
-
-/* 7) AJAX: verify OTP */
-add_action('wp_ajax_sawp_verify_otp', 'sawp_verify_otp_handler');
-add_action('wp_ajax_nopriv_sawp_verify_otp', 'sawp_verify_otp_handler');
-function sawp_verify_otp_handler() {
-    check_ajax_referer('sawp_verify_otp', 'nonce');
-    if (!WC()->session) { WC()->initialize_session(); }
-
-    $posted = isset($_POST['code']) ? preg_replace('/\D+/', '', (string)$_POST['code']) : '';
-    if (!$posted) wp_send_json_error('Cod lipsă.');
-
-    $data = WC()->session->get('sawp_otp');
-    if (empty($data) || empty($data['code'])) wp_send_json_error('Nicio cerere OTP activă.');
-    if (time() > (int)$data['expires'])     wp_send_json_error('Cod expirat.');
-    if ($posted !== (string)$data['code'])  wp_send_json_error('Cod incorect.');
-
-    $data['verified'] = true;
-    WC()->session->set('sawp_otp', $data);
-    wp_send_json_success(true);
-}
-
-/* 8) Validare server-side: oprește checkout-ul fără OTP valid (doar pentru metodele bifate) */
-add_action('woocommerce_after_checkout_validation', function ($data, $errors) {
-    $otp  = get_option('sawp_otp_opts', []);
-    $opts = get_option('sawp_opts', []);
-    if (empty($otp['enabled']) || empty($otp['template_id']) || empty($opts['token'])) return;
-
-    $methods = (array)($otp['methods'] ?? []);
-    $selected_method = '';
-    if (is_array($data) && isset($data['payment_method'])) {
-        $selected_method = sanitize_text_field($data['payment_method']);
-    } elseif (isset($_POST['payment_method'])) {
-        $selected_method = sanitize_text_field(wp_unslash($_POST['payment_method']));
-    }
-    if ($methods && $selected_method && !in_array($selected_method, $methods, true)) return;
-
-    if (!WC()->session) { WC()->initialize_session(); }
-    $sess = WC()->session->get('sawp_otp');
-
-    if (empty($sess) || empty($sess['verified'])) {
-        $errors->add('sawp_otp', __('Trebuie să validați codul OTP înainte de a plăti.', 'notice-sms-connector'));
-        return;
-    }
-    if (time() > (int)$sess['expires']) {
-        $errors->add('sawp_otp', __('Codul OTP a expirat. Reîncercați.', 'notice-sms-connector'));
-        return;
-    }
-    $posted_phone = '';
-    if (is_array($data) && isset($data['billing_phone'])) {
-        $posted_phone = preg_replace('/\D+/', '', (string)$data['billing_phone']);
-    } elseif (isset($_POST['billing_phone'])) {
-        $posted_phone = preg_replace('/\D+/', '', (string)wp_unslash($_POST['billing_phone']));
-    }
-    if ($posted_phone && !empty($sess['phone']) && $posted_phone !== $sess['phone']) {
-        $errors->add('sawp_otp', __('Numărul de telefon s-a modificat. Trimiteți din nou codul OTP.', 'notice-sms-connector'));
-        return;
-    }
-}, 10, 2);
-
-
 /* ================== GĂSIRE COMANDĂ DUPĂ TELEFON ================== */
 function sawp_find_order_by_phone($phone) {
     global $wpdb;
     $clean = preg_replace('/\D+/', '', (string)$phone);
     if ($clean === '') { return 0; }
-    
+
     // Try different phone number formats
     $patterns = [
         '%' . $clean,                    // Exact match
         '%40' . substr($clean, 1),       // International format (407xxxx)
         '%' . substr($clean, 1)          // Without country code (7xxxx)
     ];
-    
+
     foreach ($patterns as $pattern) {
         $order_id = $wpdb->get_var($wpdb->prepare(
             "SELECT post_id FROM {$wpdb->postmeta}
@@ -3346,11 +2755,78 @@ function sawp_find_order_by_phone($phone) {
              ORDER BY post_id DESC LIMIT 1",
             $pattern
         ));
-        
+
         if ($order_id) {
             return intval($order_id);
         }
     }
-    
+
     return 0;
+}
+
+/* ================== PROCESARE CONFIRMĂRI SMS ================== */
+function sawp_process_confirmation_sms($sms_list) {
+    if (!is_array($sms_list)) return;
+
+    foreach ($sms_list as $sms) {
+        $message = sawp_extract_message($sms);
+        $phone = sawp_extract_phone_raw($sms);
+
+        // Check if message contains confirmation keywords (case insensitive)
+        $confirmation_keywords = ['da', 'yes', 'confirm', 'confirmat', 'ok'];
+        $is_confirmation = false;
+
+        foreach ($confirmation_keywords as $keyword) {
+            if (stripos($message, $keyword) !== false) {
+                $is_confirmation = true;
+                break;
+            }
+        }
+
+        if ($is_confirmation) {
+            $order_id = sawp_find_order_by_phone($phone);
+            if ($order_id > 0) {
+                $order = wc_get_order($order_id);
+                if ($order) {
+                    // Mark order as confirmed
+                    $order->update_meta_data('_notice_confirmed', '1');
+                    $order->update_meta_data('_notice_confirmation_date', current_time('mysql'));
+                    $order->save();
+                }
+            }
+        }
+    }
+}
+
+/* ================== FILTRU PENTRU AFIȘARE BADGE CONFIRMARE ================== */
+add_filter('woocommerce_admin_order_status', 'sawp_add_confirmation_badge', 10, 2);
+function sawp_add_confirmation_badge($status_html, $order) {
+    if (!$order instanceof WC_Order) return $status_html;
+
+    $is_confirmed = $order->get_meta('_notice_confirmed');
+
+    if ($is_confirmed === '1') {
+        $badge = '<span class="sawp-confirmation-badge"> - Confirmată</span>';
+        $status_html .= $badge;
+    }
+
+    return $status_html;
+}
+
+/* ================== CSS PENTRU BADGE CONFIRMARE ================== */
+add_action('admin_head', 'sawp_add_confirmation_badge_css');
+function sawp_add_confirmation_badge_css() {
+    echo '<style>
+        .sawp-confirmation-badge {
+            background-color: #9333ea;
+            color: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 5px;
+            display: inline-block;
+            vertical-align: middle;
+        }
+    </style>';
 }
