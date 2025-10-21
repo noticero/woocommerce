@@ -42,9 +42,168 @@ function sawp_add_custom_statuses_to_list($order_statuses) {
 }
 
 add_action('wp_footer', function(){ if (function_exists('is_checkout') && is_checkout()) echo '<style>#sawp-otp-verify{width:100%!important;display:block!important}</style>'; });
+
 add_action('wp_footer',function(){ if(function_exists('is_checkout')&&is_checkout()){ $o=get_option('sawp_otp_opts',[]); $s=get_option('sawp_opts',[]); $enabled=!empty($o['enabled'])&&!empty($o['template_id'])&&!empty($s['token']); $methods=(isset($o['methods'])&&is_array($o['methods']))?array_values($o['methods']):[]; echo '<script>!function($){var en='.($enabled?'true':'false').', ms='.( $methods?json_encode(array_values($methods)):'[]' ).';function tg(){var m=$(\'input[name=payment_method]:checked\').val()||"";var need=en&&(ms.length?ms.indexOf(m)!==-1:true);var sel="#place_order, .wc-block-components-checkout-place-order-button"; if(need){$(sel).hide();}else{$(sel).show().prop("disabled",false);} }$(document).on("change payment_method_selected updated_checkout",tg);$(tg);} (jQuery);</script>'; }});
+/* ================== STATUS „CONFIRMATĂ” (MOV) ================== */
+
+/** 1) Înregistrare status nou */
+add_action('init', function () {
+    register_post_status('wc-sms-confirmed', [
+        'label'                     => _x('Confirmată', 'Order status', 'notice-sms-connector'),
+        'public'                    => true,
+        'exclude_from_search'       => false,
+        'show_in_admin_all_list'    => true,
+        'show_in_admin_status_list' => true,
+        'label_count'               => _n_noop('Confirmată (%s)', 'Confirmată (%s)', 'notice-sms-connector'),
+    ]);
+});
+
+/** 2) Afișare în lista de statusuri */
+add_filter('wc_order_statuses', function ($st) {
+    $st['wc-sms-confirmed'] = _x('Confirmată', 'Order status', 'notice-sms-connector');
+    return $st;
+});
+
+/** 3) Badge mov în ecranul Orders */
+add_action('admin_head', function () {
+    echo '<style>
+        .order-status.status-sms-confirmed,
+        mark.order-status.status-sms-confirmed {
+            background:#a855f7!important; color:#fff!important;
+        }
+    </style>';
+});
 
 
+/* ================== LOGICA „DA” → CONFIRMATĂ ================== */
+
+/** Helper: e „da” (cu punctuație/whitespace ignorate, case-insensitive)? */
+if (!function_exists('sawp_is_affirmative_da')) {
+function sawp_is_affirmative_da($text) {
+    $t = wp_strip_all_tags((string)$text);
+    $t = strtolower(trim($t));
+    // elimină punctuație/spații multiple
+    $t = preg_replace('/[^\p{L}\p{N}]+/u', '', $t);
+    return ($t === 'da'); // strict „da”
+}}
+/** Helper: marchează comanda Confirmată dacă e în processing și mesajul e „da” */
+if (!function_exists('sawp_confirm_via_inbound_sms')) {
+function sawp_confirm_via_inbound_sms($raw_phone, $raw_message) {
+    if (!function_exists('wc_get_order')) return;
+
+    // e „da”?
+    if (!sawp_is_affirmative_da($raw_message)) return;
+
+    // găsește comanda după telefonul clientului
+    if (!function_exists('sawp_find_order_by_phone')) return;
+    $order_id = sawp_find_order_by_phone($raw_phone);
+    if (!$order_id) return;
+
+    $order = wc_get_order($order_id);
+    if (!$order) return;
+
+    // doar dacă e în processing
+    if ($order->get_status() !== 'processing') return;
+
+    // dacă e deja confirmată, nu mai face nimic
+    if ($order->get_status() === 'sms-confirmed') return;
+
+    // marchează Confirmată
+    $order->add_order_note(__('Confirmare client prin SMS: „da”. Status setat la „Confirmată”.', 'notice-sms-connector'));
+    $order->update_status('sms-confirmed', '', true);
+}}
+/** Parser robust pentru SMS (reutilizează helperii existenți dacă îi ai deja) */
+if (!function_exists('sawp_pick_phone_from_sms')) {
+function sawp_pick_phone_from_sms($sms) {
+    if (function_exists('sawp_extract_phone_raw'))  return sawp_extract_phone_raw($sms);
+    // fallbackuri comune
+    foreach (['from','sender','phone','number','msisdn','src','originator','mobile'] as $k) {
+        if (!empty($sms[$k])) return (string)$sms[$k];
+    }
+    if (!empty($sms['contact']['phone'])) return (string)$sms['contact']['phone'];
+    return '';
+}}
+if (!function_exists('sawp_pick_message_from_sms')) {
+function sawp_pick_message_from_sms($sms) {
+    if (function_exists('sawp_extract_message')) return sawp_extract_message($sms);
+    foreach (['message','body','text','content','msg','sms'] as $k) {
+        if (!empty($sms[$k])) return (string)$sms[$k];
+    }
+    if (!empty($sms['payload']['message'])) return (string)$sms['payload']['message'];
+    return '';
+}}
+
+
+/* ===== A) Procesează răspunsurile „da” la acțiunea ta existentă de refresh =====
+   (se execută ÎNAINTEA handlerului tău curent care redirecționează)
+*/
+add_action('admin_post_sawp_fetch_received', function () {
+    // încearcă să eviți dublul request: dacă există deja transientul, folosește-l;
+    $cached = get_transient('sawp_received_sms');
+
+    if (is_array($cached) && $cached) {
+        foreach ($cached as $sms) {
+            $phone = sawp_pick_phone_from_sms($sms);
+            $msg   = sawp_pick_message_from_sms($sms);
+            if ($phone && $msg) {
+                sawp_confirm_via_inbound_sms($phone, $msg);
+            }
+        }
+        return; // lasă handlerul tău existent să facă redirect
+    }
+
+    // dacă nu e în cache, facem o citire rapidă din API (nu afectăm fluxul tău)
+    $opts  = get_option('sawp_opts', []);
+    $token = trim($opts['token'] ?? '');
+    if (!$token) return;
+
+    $res = wp_remote_get('https://api.notice.ro/api/v1/sms-in', [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $token,
+            'Content-Type'  => 'application/json',
+            'Accept'        => 'application/json'
+        ],
+        'timeout' => 15
+    ]);
+    if (is_wp_error($res) || (int)wp_remote_retrieve_response_code($res) !== 200) return;
+
+    $body = json_decode(wp_remote_retrieve_body($res), true);
+    $list = [];
+    if (isset($body['data']) && is_array($body['data'])) $list = $body['data'];
+    elseif (is_array($body)) $list = $body;
+
+    foreach ($list as $sms) {
+        $phone = sawp_pick_phone_from_sms($sms);
+        $msg   = sawp_pick_message_from_sms($sms);
+        if ($phone && $msg) {
+            sawp_confirm_via_inbound_sms($phone, $msg);
+        }
+    }
+}, 1); // PRIORITATE 1: rulează înainte de handlerul tău care redirecționează
+
+
+/* ===== B) (Opțional) Endpoint REST pentru webhook Notice =====
+   POST /wp-json/notice/v1/sms-in  cu payload ce conține „from” și „message”
+*/
+add_action('rest_api_init', function () {
+    register_rest_route('notice/v1', '/sms-in', [
+        'methods'  => 'POST',
+        'permission_callback' => '__return_true', // adaugă securizare dacă vrei (secret)
+        'callback' => function (\WP_REST_Request $req) {
+            $data = $req->get_json_params();
+            if (!is_array($data)) $data = [];
+
+            $phone = sawp_pick_phone_from_sms($data);
+            $msg   = sawp_pick_message_from_sms($data);
+
+            if ($phone && $msg) {
+                sawp_confirm_via_inbound_sms($phone, $msg);
+                return new \WP_REST_Response(['ok' => true], 200);
+            }
+            return new \WP_REST_Response(['ok' => false, 'reason' => 'missing phone/message'], 400);
+        }
+    ]);
+});
 
 /* ================== ACTIVARE ================== */
 register_activation_hook(__FILE__, 'sawp_activate');
