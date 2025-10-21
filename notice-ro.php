@@ -3254,7 +3254,7 @@ function sawp_process_order_confirmation_sms($sms_data) {
     return $order_id; // Returnează ID-ul comenzii confirmate
 }
 
-// Verifică SMS-urile pentru confirmări
+// Verifică SMS-urile pentru confirmări - DOAR MANUAL
 function sawp_check_sms_confirmations() {
     $received_sms = get_transient('sawp_received_sms');
     
@@ -3275,9 +3275,6 @@ function sawp_check_sms_confirmations() {
         }
     }
 }
-
-// Rulează verificarea la încărcarea paginii de administrare
-add_action('admin_init', 'sawp_check_sms_confirmations');
 
 // Adaugă coloană pentru confirmare SMS în lista de comenzi
 add_filter('manage_edit-shop_order_columns', 'sawp_add_sms_confirmation_column');
@@ -3457,8 +3454,6 @@ function sawp_sms_confirmation_styles() {
     <?php
 }
 
-// Procesează automat SMS-urile noi la preluare
-add_action('sawp_after_fetch_received', 'sawp_auto_process_new_sms');
-function sawp_auto_process_new_sms() {
-    sawp_check_sms_confirmations();
-}
+// ȘTERGE acțiunile automate - NU mai procesa automat!
+// remove_action('admin_init', 'sawp_check_sms_confirmations');
+// remove_action('sawp_after_fetch_received', 'sawp_auto_process_new_sms');
