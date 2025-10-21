@@ -3203,7 +3203,6 @@ function sawp_find_order_by_phone($phone) {
     
     return 0;
 }
-
 /* ================== CONFIRMARE COMENZI PRIN SMS + BADGE ================== */
 
 // Procesează SMS-urile de confirmare "Da", "DA", "da" - ÎMBUNĂTĂȚITĂ
@@ -3213,7 +3212,7 @@ function sawp_process_order_confirmation_sms($sms_data) {
     
     // Verifică dacă mesajul conține confirmarea (mai flexibil)
     $clean_message = strtolower(trim($message));
-    $confirmation_keywords = ['da', 'yes', 'confirm', 'ok', 'okay'];
+    $confirmation_keywords = ['da', 'yes', 'DA', 'Da', 'okay'];
     $is_confirmation = in_array($clean_message, $confirmation_keywords);
     
     if (!$is_confirmation || !$phone) {
@@ -3242,6 +3241,11 @@ function sawp_process_order_confirmation_sms($sms_data) {
     $order->update_meta_data('_sawp_sms_confirmed_at', current_time('mysql'));
     $order->update_meta_data('_sawp_sms_confirmed_phone', $phone);
     $order->save();
+    
+    // SCHIMBARE STATUS COMANDĂ - NOU
+    if ($order->has_status('processing')) {
+        $order->update_status('completed', __('Status actualizat automat după confirmare SMS.', 'notice-sms-connector'));
+    }
     
     // Adaugă o notă la comandă
     $order->add_order_note(
@@ -3349,7 +3353,7 @@ function sawp_add_check_sms_button_orders_page($post_type) {
                     $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
                 }).fail(function() {
                     alert("Eroare la comunicarea cu serverul.");
-                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
+                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
                 });
             });
         });
@@ -3406,6 +3410,7 @@ function sawp_check_sms_confirmations_ajax_handler() {
     
     // Procesează confirmările - CORECTAT
     $confirmed_count = 0;
+    $status_changed_count = 0;
     $total_sms = count($data);
     
     if (is_array($data)) {
@@ -3413,14 +3418,25 @@ function sawp_check_sms_confirmations_ajax_handler() {
             $order_id = sawp_process_order_confirmation_sms($sms);
             if ($order_id) {
                 $confirmed_count++; // Numără doar comenzile confirmate cu succes
+                
+                // Verifică dacă statusul a fost schimbat
+                $order = wc_get_order($order_id);
+                if ($order && $order->has_status('completed')) {
+                    $status_changed_count++;
+                }
             }
         }
     }
     
     wp_send_json_success([
-        'message' => sprintf(__('S-au procesat %d SMS-uri. %d comenzi confirmate.', 'notice-sms-connector'), 
-                           $total_sms, $confirmed_count),
+        'message' => sprintf(
+            __('S-au procesat %d SMS-uri. %d comenzi confirmate. %d comenzi finalizate.', 'notice-sms-connector'), 
+            $total_sms, 
+            $confirmed_count,
+            $status_changed_count
+        ),
         'confirmed' => $confirmed_count,
+        'status_changed' => $status_changed_count,
         'total_sms' => $total_sms
     ]);
 }
@@ -3453,7 +3469,3 @@ function sawp_sms_confirmation_styles() {
     </style>
     <?php
 }
-
-// ȘTERGE acțiunile automate - NU mai procesa automat!
-// remove_action('admin_init', 'sawp_check_sms_confirmations');
-// remove_action('sawp_after_fetch_received', 'sawp_auto_process_new_sms');
