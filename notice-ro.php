@@ -3206,48 +3206,34 @@ function sawp_find_order_by_phone($phone) {
 
 /* ================== CONFIRMARE COMENZI PRIN SMS + BADGE ================== */
 
-// Procesează SMS-urile de confirmare "Da", "DA", "da" - CORECTAT STRICT
+// Procesează SMS-urile de confirmare "Da", "DA", "da" - ÎMBUNĂTĂȚITĂ
 function sawp_process_order_confirmation_sms($sms_data) {
     $message = sawp_extract_message($sms_data);
     $phone = sawp_extract_phone_raw($sms_data);
     
-    // Debug: afișează ce se procesează
-    error_log("SAWP Processing SMS - Phone: $phone, Message: '$message'");
-    
-    // Verifică STRICT dacă mesajul conține DOAR confirmarea (fără alte texte)
+    // Verifică dacă mesajul conține confirmarea (mai flexibil)
     $clean_message = strtolower(trim($message));
-    
-    // DOAR aceste cuvinte exacte sunt considerate confirmări
     $confirmation_keywords = ['da', 'yes', 'confirm', 'ok', 'okay'];
     $is_confirmation = in_array($clean_message, $confirmation_keywords);
     
-    if (!$is_confirmation) {
-        error_log("SAWP: NOT a confirmation message - '$clean_message' not in " . implode(', ', $confirmation_keywords));
-        return false; // Nu este confirmare
-    }
-    
-    if (!$phone) {
-        error_log("SAWP: No phone number");
-        return false; // Nu are telefon
+    if (!$is_confirmation || !$phone) {
+        return false; // Nu este confirmare sau nu are telefon
     }
     
     $order_id = sawp_find_order_by_phone($phone);
     
     if (!$order_id) {
-        error_log("SAWP: No order found for phone: $phone");
         return false; // Nu s-a găsit comandă pentru acest telefon
     }
     
     $order = wc_get_order($order_id);
     if (!$order) {
-        error_log("SAWP: Order not found: $order_id");
         return false; // Comanda nu există
     }
     
     // Verifică dacă comanda nu este deja confirmată
     $already_confirmed = $order->get_meta('_sawp_sms_confirmed') === 'yes';
     if ($already_confirmed) {
-        error_log("SAWP: Order already confirmed: $order_id");
         return false; // Este deja confirmată
     }
     
@@ -3260,25 +3246,19 @@ function sawp_process_order_confirmation_sms($sms_data) {
     // Adaugă o notă la comandă
     $order->add_order_note(
         sprintf(
-            __('Comandă confirmată prin SMS de la %s. Mesaj: "%s"', 'notice-sms-connector'),
-            $phone,
-            $message
+            __('Comandă confirmată prin SMS de la %s', 'notice-sms-connector'),
+            $phone
         )
     );
     
-    error_log("SAWP: Order confirmed successfully: $order_id with message: '$message'");
     return $order_id; // Returnează ID-ul comenzii confirmate
 }
 
-// Verifică SMS-urile pentru confirmări - CORECTAT
+// Verifică SMS-urile pentru confirmări
 function sawp_check_sms_confirmations() {
     $received_sms = get_transient('sawp_received_sms');
     
     if (is_array($received_sms)) {
-        error_log("SAWP: Checking " . count($received_sms) . " SMS for confirmations");
-        $processed_count = 0;
-        $confirmed_count = 0;
-        
         foreach ($received_sms as $sms) {
             // Verifică dacă SMS-ul a fost deja procesat
             $sms_id = $sms['id'] ?? md5(serialize($sms));
@@ -3286,25 +3266,18 @@ function sawp_check_sms_confirmations() {
             
             if (!get_transient($processed_key)) {
                 $order_id = sawp_process_order_confirmation_sms($sms);
-                $processed_count++;
                 
                 if ($order_id) {
-                    $confirmed_count++;
                     // Marchează SMS-ul ca procesat (expiră după 24 de ore)
                     set_transient($processed_key, true, 24 * HOUR_IN_SECONDS);
-                    error_log("SAWP: SMS marked as processed and confirmed: $sms_id");
                 }
             }
         }
-        
-        error_log("SAWP: Processed $processed_count SMS, confirmed $confirmed_count orders");
-    } else {
-        error_log("SAWP: No SMS data found in transient");
     }
 }
 
-// Rulează verificarea doar când se apasă butonul, NU automat
-// REMOVED: add_action('admin_init', 'sawp_check_sms_confirmations');
+// Rulează verificarea la încărcarea paginii de administrare
+add_action('admin_init', 'sawp_check_sms_confirmations');
 
 // Adaugă coloană pentru confirmare SMS în lista de comenzi
 add_filter('manage_edit-shop_order_columns', 'sawp_add_sms_confirmation_column');
@@ -3363,10 +3336,6 @@ function sawp_add_check_sms_button_orders_page($post_type) {
         echo '<script>
         jQuery(document).ready(function($) {
             $("#sawp-check-sms-confirmations").on("click", function() {
-                if (!confirm("Sigur doriți să verificați confirmările SMS? Această acțiune va procesa toate SMS-urile primite.")) {
-                    return;
-                }
-                
                 var $btn = $(this);
                 $btn.prop("disabled", true).text("Se verifică...");
                 
@@ -3488,5 +3457,8 @@ function sawp_sms_confirmation_styles() {
     <?php
 }
 
-// REMOVED: Procesare automată - acum se face DOAR manual prin buton
-// add_action('sawp_after_fetch_received', 'sawp_auto_process_new_sms');
+// Procesează automat SMS-urile noi la preluare
+add_action('sawp_after_fetch_received', 'sawp_auto_process_new_sms');
+function sawp_auto_process_new_sms() {
+    sawp_check_sms_confirmations();
+}
