@@ -1190,6 +1190,9 @@ function sawp_render_confirmations_page() {
             border-radius: 2px;
             margin-bottom: 24px;
         }
+			
+		
+			
         </style>
         
         <div class="sawp-card">
@@ -1421,6 +1424,8 @@ function sawp_render_received_page() {
             border-radius: 8px;
             border: 1px solid #e5e7eb;
         }
+			
+		
         
         .sawp-header-actions {
             display: flex;
@@ -3469,3 +3474,405 @@ function sawp_sms_confirmation_styles() {
     </style>
     <?php
 }
+/* ------------------------------------------------------------
+ *  Sursa AWB selectabilă (Auto / Colete-Online / Sameday)
+ *  UI + salvare + detecție Sameday (meta & DOM, AWB alfanumeric)
+ *  Înlocuiește blocul tău curent cu acesta.
+ * ------------------------------------------------------------ */
+
+/**
+ * 1) Câmp nou în Setări (radio + logo-uri)
+ */
+add_action('admin_init','sawp_register_awb_source_field_pro');
+function sawp_register_awb_source_field_pro(){
+    add_settings_field(
+        'sawp_awb_source',
+        '<span class="dashicons dashicons-tag"></span> Sursă AWB',
+        'sawp_field_awb_source_pro',
+        'sawp-settings',
+        'sawp_main'
+    );
+}
+
+function sawp_field_awb_source_pro() {
+    $opts    = get_option('sawp_opts', []);
+    $val     = $opts['awb_source'] ?? 'auto';
+    $logo_co = 'https://govnet.ro/uploads/images/33_Colete%20Online%20Logo.jpeg';
+    $logo_sd = 'https://sameday.ro/app/themes/samedaytwo/public/images/logo/logo-sameday.svg';
+    ?>
+    <style>
+      .sawp-awb-src-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:100%}
+      .sawp-awb-card{
+        border:1px solid #e5e7eb;border-radius:10px;padding:12px;display:flex;align-items:center;gap:12px;background:#fff;
+        transition:box-shadow .15s, border-color .15s
+      }
+      .sawp-awb-card:hover{box-shadow:0 4px 10px rgba(0,0,0,.05);border-color:#d1d5db}
+      .sawp-awb-radio{display:flex;align-items:center;gap:10px;width:100%}
+      .sawp-awb-logo{width:46px;height:46px;object-fit:contain;background:#fff;border-radius:6px;border:1px solid #f3f4f6}
+      .sawp-awb-title{font-weight:600;color:#111827}
+      .sawp-awb-desc{font-size:12px;color:#6b7280;margin-top:2px}
+      span.sawp-awb-radio > input[type=radio]:checked::before{width:15px;height:15px;background:#6366f1}
+      @media (max-width:900px){.sawp-awb-src-grid{grid-template-columns:1fr}}
+    </style>
+
+    <div class="sawp-awb-src-grid">
+
+      <label class="sawp-awb-card">
+        <span class="sawp-awb-radio">
+          <input type="radio" name="sawp_opts[awb_source]" value="auto" <?php checked($val,'auto'); ?>>
+          <span>
+            <div class="sawp-awb-title">Auto</div>
+            <div class="sawp-awb-desc">Detectează automat din ambele integrări. Primul AWB găsit este folosit.</div>
+          </span>
+        </span>
+      </label>
+
+      <label class="sawp-awb-card">
+        <span class="sawp-awb-radio">
+          <input type="radio" name="sawp_opts[awb_source]" value="coleteonline" <?php checked($val,'coleteonline'); ?>>
+          <img class="sawp-awb-logo" src="<?php echo esc_url($logo_co); ?>" alt="Colete-Online" loading="lazy">
+          <span>
+            <div class="sawp-awb-title">Colete-Online</div>
+            <div class="sawp-awb-desc">Preia AWB exclusiv din pluginul Colete-Online.</div>
+          </span>
+        </span>
+      </label>
+
+      <label class="sawp-awb-card">
+        <span class="sawp-awb-radio">
+          <input type="radio" name="sawp_opts[awb_source]" value="sameday" <?php checked($val,'sameday'); ?>>
+          <img class="sawp-awb-logo" src="<?php echo esc_url($logo_sd); ?>" alt="Sameday" loading="lazy">
+          <span>
+            <div class="sawp-awb-title">Sameday</div>
+            <div class="sawp-awb-desc">Preia AWB exclusiv din pluginul Sameday.</div>
+          </span>
+        </span>
+      </label>
+
+    </div>
+    <p class="description">Alegerea influențează ce sursă are prioritate când salvăm <code>_notice_awb</code> (pentru <code>{awb}</code> în Notice).</p>
+    <?php
+}
+
+/**
+ * 2) Salvăm opțiunea (fără să atingem sanitizarea existentă)
+ */
+add_filter('pre_update_option_sawp_opts','sawp_merge_awb_source_opt_pro',10,2);
+function sawp_merge_awb_source_opt_pro($new_value, $old_value){
+    if (!is_array($new_value)) $new_value = [];
+    if (isset($_POST['sawp_opts']['awb_source'])) {
+        $allowed = ['auto','coleteonline','sameday'];
+        $val = sanitize_text_field($_POST['sawp_opts']['awb_source']);
+        $new_value['awb_source'] = in_array($val,$allowed,true) ? $val : 'auto';
+    } else {
+        if (!isset($new_value['awb_source'])) {
+            $new_value['awb_source'] = $old_value['awb_source'] ?? 'auto';
+        }
+    }
+    return $new_value;
+}
+
+/** Helper: normalizează AWB (uppercase, fără spații) */
+if (!function_exists('sawp_normalize_awb')) {
+    function sawp_normalize_awb($awb) {
+        $awb = is_string($awb) ? trim($awb) : '';
+        $awb = preg_replace('/[\s\r\n\t]+/', '', $awb);
+        return strtoupper($awb);
+    }
+}
+
+/**
+ * 3) Detecție AWB din Sameday (META) — ține cont de sursa aleasă
+ *    - prioritate 5 (înainte de alte hook-uri)
+ *    - acceptă AWB alfanumeric 10–30 caractere (ex: 1GAVLN424242973001)
+ */
+add_action('updated_post_meta', function($meta_id, $post_id, $meta_key, $meta_value){
+    if (get_post_type($post_id) !== 'shop_order') return;
+
+    $opts       = get_option('sawp_opts', []);
+    $awb_source = $opts['awb_source'] ?? 'auto';
+
+    // Dacă e ales explicit Colete-Online, nu intervenim
+    if ($awb_source === 'coleteonline') return;
+
+    $k = strtolower((string)$meta_key);
+    // „sameday” sau „sd” în cheie + awb/track/parcel
+    if (strpos($k,'sameday') === false && strpos($k,'sd') === false) return;
+    if (strpos($k,'awb') === false && strpos($k,'track') === false && strpos($k,'parcel') === false) return;
+
+    $order = wc_get_order($post_id);
+    if (!$order) return;
+
+    // nu rescriem dacă avem deja
+    if ($order->get_meta('_notice_awb')) return;
+
+    // dacă ai și un toggle separat pentru Sameday, îl poți respecta
+    if ($awb_source !== 'sameday' && $awb_source !== 'auto' && empty($opts['enable_sameday_awb'])) return;
+
+    $candidate = '';
+
+    if (is_string($meta_value) && $meta_value !== '') {
+        $candidate = $meta_value;
+    } elseif (is_array($meta_value)) {
+        // chei uzuale
+        foreach (['awb','awbNumber','awb_number','tracking_number','trackingNumber','parcel_awb','sameday_awb','sameday_awb_number'] as $kk) {
+            if (!empty($meta_value[$kk])) { $candidate = (string)$meta_value[$kk]; break; }
+        }
+        // nested: parcels / packages
+        if (!$candidate) {
+            foreach (['parcels','parcel','packages','package'] as $kk) {
+                if (!empty($meta_value[$kk]) && is_array($meta_value[$kk])) {
+                    foreach ((array)$meta_value[$kk] as $p) {
+                        if (is_array($p)) {
+                            foreach (['awb','awbNumber','awb_number','tracking_number','trackingNumber'] as $kk2) {
+                                if (!empty($p[$kk2])) { $candidate = (string)$p[$kk2]; break 3; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!$candidate) return;
+
+    $candidate = sawp_normalize_awb($candidate);
+    // AWB Sameday: alfanumeric, 10–30 lungime
+    if (!preg_match('/^[A-Z0-9]{10,30}$/', $candidate)) return;
+
+    $order->update_meta_data('_notice_awb', $candidate);
+    $order->save();
+}, 5, 4);
+
+
+/**
+ * 4) Fallback DOM (Sameday) — detectează automat AWB din pop-up „Awb History”
+ *     și îl salvează în meta _notice_awb (folosit de SMS Auto Woo PRO).
+ *     Rulăm doar pe ecranul de editare comandă (shop_order).
+ */
+add_action('admin_footer', function () {
+    global $post;
+    if (!$post || get_post_type($post) !== 'shop_order') return;
+
+    // Rulăm doar dacă sursa este Auto sau Sameday
+    $opts = get_option('sawp_opts', []);
+    $awb_source = $opts['awb_source'] ?? 'auto';
+    if (!in_array($awb_source, ['auto','sameday'], true)) return;
+
+    $nonce = wp_create_nonce('save_awb_nonce');
+    $ajax  = admin_url('admin-ajax.php');
+    ?>
+    <script>
+    (function($){
+      // ==== gardă împotriva salvărilor multiple
+      var __sawp_awb_saving = false;
+      var __sawp_awb_saved  = false;
+
+      // ==== 1) Regex alfanumeric strict, 10–30 caractere, minim o literă + o cifră
+      function pickAWBFromText(txt){
+        if (!txt) return null;
+        var up = String(txt).toUpperCase();
+        // cel puțin o literă și cel puțin o cifră; lungime 10–30
+        var re = /\b(?=[A-Z0-9]{10,30}\b)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+\b/g;
+        var m, hits = [];
+        while ((m = re.exec(up)) !== null) hits.push(m[0]);
+        if (!hits.length) return null;
+
+        // preferă candidatele cu multe cifre și care încep cu literă (pattern des întâlnit la Sameday)
+        hits.sort(function(a,b){
+          function score(s){
+            var digits=(s.match(/\d/g)||[]).length;
+            var startsLetter = /^[A-Z]/.test(s) ? 1 : 0;
+            return digits*10 + startsLetter;
+          }
+          return score(b)-score(a);
+        });
+        return hits[0];
+      }
+
+      // ==== 2) Citește din pop-up Awb History (data-awb-number, tabel, apoi text)
+      function extractSamedayAWB(){
+        // a) atributul data-awb-number pe celula cu .showHistoryDetails
+        var $btn = $('#TB_ajaxContent .showHistoryDetails').first();
+        var awbAttr = $btn.length ? ($btn.data('awb-number') || '') : '';
+        if (awbAttr && /\d/.test(awbAttr)) return String(awbAttr).trim().toUpperCase();
+
+        // b) a doua coloană din primul rând de date al tabelului .packages (Parcel number)
+        var $row = $('#TB_ajaxContent table.packages tr').filter(function(){
+          return $(this).find('td').length>0;
+        }).first();
+        if ($row.length){
+          var candidate = ($row.find('td').eq(1).text()||'').trim();
+          if (candidate && /\d/.test(candidate)) return candidate.toUpperCase();
+        }
+
+        // c) fallback: regex din tot textul pop-up-ului
+        var fromPopup = pickAWBFromText($('#TB_ajaxContent').text());
+        if (fromPopup) return fromPopup;
+
+        // d) ultimul fallback: întregul body (dacă pop-up-ul nu conține ceva util)
+        return pickAWBFromText(document.body.innerText || '');
+      }
+
+      // ==== 3) Salvează AWB prin AJAX în meta _notice_awb
+      function saveAWB(awb){
+        if (!awb || __sawp_awb_saving || __sawp_awb_saved) return;
+        var orderId = $('#post_ID').val();
+        if (!orderId) return;
+
+        __sawp_awb_saving = true;
+        console.log('🔄 Salvăm AWB:', awb);
+
+        $.post('<?php echo esc_js($ajax); ?>', {
+          action:   'save_awb',
+          order_id: orderId,
+          awb:      awb,
+          nonce:    '<?php echo esc_js($nonce); ?>'
+        })
+        .done(function(r){
+          console.log('✅ Răspuns AJAX:', r);
+          if (r && r.success) {
+            __sawp_awb_saved = true;
+            // dacă există meta boxul tău, încearcă să-l actualizezi vizual
+            var $box = $('#notice-awb-box-content');
+            if ($box.length){ $box.html('<p><strong>'+ awb +'</strong></p>'); }
+          } else {
+            console.warn('⚠️ Eroare la salvare AWB:', r);
+          }
+        })
+        .fail(function(){
+          console.warn('⚠️ Eroare la apelul AJAX save_awb');
+        })
+        .always(function(){
+          __sawp_awb_saving = false;
+        });
+      }
+
+      // ==== 4) Observer care prinde când apare/își schimbă conținutul pop-up-ului „Awb History”
+      const bodyObserver = new MutationObserver(function(muts){
+        // verificăm existența conținutului thickbox
+        var tb = document.getElementById('TB_ajaxContent');
+        if (!tb) return;
+
+        // dacă a apărut tabelul cu „Parcel number”, încercăm extragerea
+        var hasTable = tb.innerText && tb.innerText.indexOf('Parcel number') !== -1;
+        if (hasTable && !__sawp_awb_saved && !__sawp_awb_saving) {
+          var awb = extractSamedayAWB();
+          if (awb) {
+            console.log('📦 Găsit AWB din observer:', awb);
+            saveAWB(awb);
+          } else {
+            console.warn('❌ AWB încă negăsit în pop-up; așteptăm schimbări…');
+          }
+        }
+      });
+
+      // Observăm modificări pe tot documentul (pop-up-ul e inserat la runtime)
+      bodyObserver.observe(document.body, {childList: true, subtree: true});
+
+      // ==== 5) Helperi pentru debug din consolă
+      window.pickAWBFromText = pickAWBFromText;
+      window.sawpExtractSameday = extractSamedayAWB;
+      window.sawpSaveAWB = saveAWB;
+      window.sawp_force_extract = function(){
+        var awb = extractSamedayAWB();
+        console.log('🧪 Forțare extract →', awb);
+        if (awb) saveAWB(awb);
+      };
+    })(jQuery);
+    </script>
+    <?php
+});
+
+/* ------------------------------------------------------------
+ * 5) AJAX: salvează AWB din observerul Sameday (action = save_awb)
+ *    - Respectă sursa selectată (Auto / Colete-Online / Sameday)
+ *    - Nu atinge integrarea Colete-Online (dacă e selectată, ignoră Sameday)
+ * ------------------------------------------------------------ */
+add_action('wp_ajax_save_awb', 'sawp_ajax_save_awb');
+function sawp_ajax_save_awb() {
+    // 1) Securitate
+    check_ajax_referer('save_awb_nonce', 'nonce');
+    if ( ! current_user_can('edit_shop_orders') && ! current_user_can('manage_woocommerce') ) {
+        wp_send_json_error('Permisiune insuficientă.');
+    }
+
+    // 2) Citește sursa selectată (auto / coleteonline / sameday)
+    $opts       = get_option('sawp_opts', []);
+    $awb_source = isset($opts['awb_source']) ? sanitize_text_field($opts['awb_source']) : 'auto';
+
+    // 3) Dacă utilizatorul a ales explicit Colete-Online, ignorăm complet Sameday
+    if ($awb_source === 'coleteonline') {
+        wp_send_json_error('Sursa AWB este setată pe „Colete-Online”. Ignor AWB-ul detectat din Sameday.');
+    }
+
+    // 4) Validează input
+    $order_id = isset($_POST['order_id']) ? absint($_POST['order_id']) : 0;
+    $awb_raw  = isset($_POST['awb']) ? (string) wp_unslash($_POST['awb']) : '';
+    if (!$order_id || $awb_raw === '') {
+        wp_send_json_error('Date lipsă (order_id / awb).');
+    }
+
+    // Helper local (fallback) dacă nu e definit deja în alt loc
+    if (!function_exists('sawp_normalize_awb')) {
+        function sawp_normalize_awb($awb) {
+            $awb = is_string($awb) ? trim($awb) : '';
+            $awb = preg_replace('/[\s\r\n\t]+/', '', $awb);
+            return strtoupper($awb);
+        }
+    }
+    $awb = sawp_normalize_awb($awb_raw);
+
+    // Acceptăm AWB Sameday: alfanumeric 10–30, cu cel puțin o literă și o cifră
+    if (!preg_match('/^(?=[A-Z0-9]{10,30}$)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+$/', $awb)) {
+        wp_send_json_error('Format AWB invalid pentru Sameday.');
+    }
+
+    // 5) Găsește comanda
+    $order = wc_get_order($order_id);
+    if (!$order) {
+        wp_send_json_error('Comanda nu a fost găsită.');
+    }
+
+    $existing = (string) $order->get_meta('_notice_awb');
+
+    // 6) Logica de prioritate în funcție de setare
+    if ($awb_source === 'auto') {
+        // În modul Auto nu suprascriem dacă există deja un AWB
+        if ($existing !== '') {
+            wp_send_json_success([
+                'awb'     => $existing,
+                'skipped' => true,
+                'reason'  => 'AUTO: există deja un AWB, nu suprascriu.',
+            ]);
+        }
+        // Nu există AWB — scriem
+        $order->update_meta_data('_notice_awb', $awb);
+        $order->add_order_note(sprintf('AWB (Sameday) capturat automat: %s', $awb));
+        $order->save();
+
+        wp_send_json_success([
+            'awb'     => $awb,
+            'skipped' => false,
+            'mode'    => 'auto',
+        ]);
+    }
+
+    if ($awb_source === 'sameday') {
+        // În modul Sameday avem voie să înlocuim orice AWB existent
+        $order->update_meta_data('_notice_awb', $awb);
+        $order->add_order_note(sprintf('AWB (Sameday) setat/înlocuit din observer: %s', $awb));
+        $order->save();
+
+        wp_send_json_success([
+            'awb'      => $awb,
+            'replaced' => ($existing !== ''),
+            'mode'     => 'sameday',
+        ]);
+    }
+
+    // Fallback (dacă ajungem aici ceva e în neregulă cu setarea)
+    wp_send_json_error('Sursa AWB necunoscută.');
+}
+
+
