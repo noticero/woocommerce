@@ -2,7 +2,7 @@
 /**
  * Plugin Name: notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     4.0
+ * Version:     4.1
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
