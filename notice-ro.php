@@ -2,7 +2,7 @@
 /**
  * Plugin Name: notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     4.1
+ * Version:     4.0
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
@@ -3210,7 +3210,7 @@ function sawp_find_order_by_phone($phone) {
 }
 /* ================== CONFIRMARE COMENZI PRIN SMS + BADGE ================== */
 
-// Procesează SMS-urile de confirmare "Da", "DA", "da" - ÎMBUNĂTĂȚITĂ
+// Procesează SMS-urile de confirmare "Da", "DA", "da" - FĂRĂ SCHIMBAREA STATUSULUI
 function sawp_process_order_confirmation_sms($sms_data) {
     $message = sawp_extract_message($sms_data);
     $phone = sawp_extract_phone_raw($sms_data);
@@ -3241,16 +3241,11 @@ function sawp_process_order_confirmation_sms($sms_data) {
         return false; // Este deja confirmată
     }
     
-    // Marchează comanda ca confirmată prin SMS
+    // Marchează comanda ca confirmată prin SMS (DOAR BADGE)
     $order->update_meta_data('_sawp_sms_confirmed', 'yes');
     $order->update_meta_data('_sawp_sms_confirmed_at', current_time('mysql'));
     $order->update_meta_data('_sawp_sms_confirmed_phone', $phone);
     $order->save();
-    
-    // SCHIMBARE STATUS COMANDĂ - NOU
-    if ($order->has_status('processing')) {
-        $order->update_status('completed', __('Status actualizat automat după confirmare SMS.', 'notice-sms-connector'));
-    }
     
     // Adaugă o notă la comandă
     $order->add_order_note(
@@ -3358,7 +3353,7 @@ function sawp_add_check_sms_button_orders_page($post_type) {
                     $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
                 }).fail(function() {
                     alert("Eroare la comunicarea cu serverul.");
-                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
+                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
                 });
             });
         });
@@ -3366,7 +3361,7 @@ function sawp_add_check_sms_button_orders_page($post_type) {
     }
 }
 
-// Handler AJAX pentru verificarea confirmărilor - CORECTAT
+// Handler AJAX pentru verificarea confirmărilor - FĂRĂ SCHIMBAREA STATUSULUI
 add_action('wp_ajax_sawp_check_sms_confirmations_ajax', 'sawp_check_sms_confirmations_ajax_handler');
 function sawp_check_sms_confirmations_ajax_handler() {
     check_ajax_referer('sawp_check_sms_confirmations', 'nonce');
@@ -3413,9 +3408,8 @@ function sawp_check_sms_confirmations_ajax_handler() {
     set_transient('sawp_received_sms', $data, 15 * MINUTE_IN_SECONDS);
     set_transient('sawp_received_last_update', time(), 15 * MINUTE_IN_SECONDS);
     
-    // Procesează confirmările - CORECTAT
+    // Procesează confirmările - FĂRĂ SCHIMBAREA STATUSULUI
     $confirmed_count = 0;
-    $status_changed_count = 0;
     $total_sms = count($data);
     
     if (is_array($data)) {
@@ -3423,25 +3417,17 @@ function sawp_check_sms_confirmations_ajax_handler() {
             $order_id = sawp_process_order_confirmation_sms($sms);
             if ($order_id) {
                 $confirmed_count++; // Numără doar comenzile confirmate cu succes
-                
-                // Verifică dacă statusul a fost schimbat
-                $order = wc_get_order($order_id);
-                if ($order && $order->has_status('completed')) {
-                    $status_changed_count++;
-                }
             }
         }
     }
     
     wp_send_json_success([
         'message' => sprintf(
-            __('S-au procesat %d SMS-uri. %d comenzi confirmate. %d comenzi finalizate.', 'notice-sms-connector'), 
+            __('S-au procesat %d SMS-uri. %d comenzi confirmate prin SMS.', 'notice-sms-connector'), 
             $total_sms, 
-            $confirmed_count,
-            $status_changed_count
+            $confirmed_count
         ),
         'confirmed' => $confirmed_count,
-        'status_changed' => $status_changed_count,
         'total_sms' => $total_sms
     ]);
 }
