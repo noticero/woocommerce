@@ -2,7 +2,7 @@
 /**
  * Plugin Name: notice.ro
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     4.2
+ * Version:     4.3
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
@@ -3487,7 +3487,7 @@ if ( ! function_exists( 'sawp_normalize_awb' ) ) {
  */
 if ( ! function_exists( 'sawp_get_awb_source' ) ) {
 	function sawp_get_awb_source() {
-		$allowed = array( 'auto', 'colete', 'sameday', 'fan' );
+		$allowed = array( 'auto', 'colete', 'sameday', 'fan', 'curiero' );
 		$val     = get_option( 'notice_awb_source', 'auto' );
 
 		$val = is_string( $val ) ? strtolower( trim( $val ) ) : 'auto';
@@ -3526,7 +3526,7 @@ function notice_save_awb_source() {
 
 	check_ajax_referer( 'notice_save_awb_source', 'nonce' );
 
-	$allowed = array( 'auto', 'colete', 'sameday', 'fan' );
+	$allowed = array( 'auto', 'colete', 'sameday', 'fan', 'curiero' );
 	$val     = isset( $_POST['awb_source'] ) ? sanitize_text_field( wp_unslash( $_POST['awb_source'] ) ) : 'auto';
 	$val     = strtolower( trim( $val ) );
 
@@ -3548,6 +3548,7 @@ function sawp_field_awb_source_pro() {
 	$logo_co  = 'https://govnet.ro/uploads/images/33_Colete%20Online%20Logo.jpeg';
 	$logo_sd  = 'https://sameday.ro/app/themes/samedaytwo/public/images/logo/logo-sameday.svg';
 	$logo_fan = 'https://www.fancourier.ro/wp-content/uploads/2023/03/logo.svg';
+	$logo_curiero = 'https://curie.ro/wp-content/uploads/2020/03/CurieRO_logo_full.svg'; // opțional
 
 	$choices = array(
 		'auto'   => array(
@@ -3570,6 +3571,12 @@ function sawp_field_awb_source_pro() {
 			'desc'  => 'Folosește exclusiv AWB-urile din integrările FAN Courier (selfAWB / plugin WooCommerce).',
 			'logo'  => $logo_fan,
 		),
+		
+		'curiero' => array(
+          'label' => 'Curiero',
+          'desc'  => 'Folosește AWB-urile generate de pluginul Curiero.',
+          'logo'  => $logo_curiero,
+  ),
 	);
 
 	// Nonce pentru AJAX
@@ -3979,4 +3986,175 @@ function sawp_detect_awb_from_fan_meta( $meta_id, $post_id, $meta_key, $meta_val
 	$order->update_meta_data( '_notice_awb', $candidate );
 	$order->add_order_note( sprintf( 'AWB (FAN Courier) setat automat (fallback meta): %s', $candidate ) );
 	$order->save();
+}
+
+/**
+ * 4) Detecție AWB din meta Curiero (plugin Curiero/CurieRO).
+ * Curiero salvează de obicei meta-uri de tip awb_fan, awb_sameday, awb_dpd etc.
+ */
+add_action( 'updated_post_meta', 'sawp_detect_awb_from_curiero_meta', 12, 4 );
+function sawp_detect_awb_from_curiero_meta( $meta_id, $post_id, $meta_key, $meta_value ) {
+	if ( get_post_type( $post_id ) !== 'shop_order' ) {
+		return;
+	}
+
+	$order = wc_get_order( $post_id );
+	if ( ! $order ) {
+		return;
+	}
+
+	$awb_source = sawp_get_awb_source();
+	if ( ! in_array( $awb_source, array( 'auto', 'curiero' ), true ) ) {
+		return;
+	}
+
+	$existing = (string) $order->get_meta( '_notice_awb' );
+	// În Auto nu suprascriem un AWB deja setat.
+	if ( 'auto' === $awb_source && $existing !== '' ) {
+		return;
+	}
+
+	$key_l = strtolower( (string) $meta_key );
+
+	// Chei tipice Curiero: awb_fan, awb_sameday, awb_dpd, awb_urgent_cargus, awb_gls, awb_mygls, awb_bookurier, awb_innoship, awb_memex, awb_optimus_id etc.
+	$is_curiero_key = ( strpos( $key_l, 'awb_' ) === 0 ) || ( strpos( $key_l, 'curiero' ) !== false );
+
+	if ( ! $is_curiero_key ) {
+		return;
+	}
+
+	$candidate = '';
+
+	if ( is_string( $meta_value ) && $meta_value !== '' ) {
+		$candidate = $meta_value;
+	} elseif ( is_array( $meta_value ) ) {
+		foreach ( array( 'awb', 'awbNumber', 'awb_number', 'tracking_number', 'trackingNumber' ) as $kk ) {
+			if ( ! empty( $meta_value[ $kk ] ) ) {
+				$candidate = (string) $meta_value[ $kk ];
+				break;
+			}
+		}
+	}
+
+	if ( ! $candidate ) {
+		return;
+	}
+
+	$candidate = sawp_normalize_awb( $candidate );
+
+	// Curiero poate avea AWB numeric sau alfanumeric, deci validare mai permisivă.
+	if ( ! preg_match( '/^[A-Z0-9]{6,30}$/', $candidate ) ) {
+		return;
+	}
+
+	$order->update_meta_data( '_notice_awb', $candidate );
+	$order->add_order_note( sprintf( 'AWB (Curiero) setat automat: %s', $candidate ) );
+	$order->save();
+}
+
+/**
+ * Sync AWB din link-uri de tip ...#awb=XXXX (ex: Curiero/Sameday UI) în _notice_awb
+ */
+add_action( 'admin_footer', 'notice_sync_curiero_awb_from_link' );
+function notice_sync_curiero_awb_from_link() {
+	if ( ! function_exists( 'get_current_screen' ) ) return;
+	$screen = get_current_screen();
+	if ( ! $screen ) return;
+
+	// Woo orders (HPOS) sau comanda clasică
+	if ( $screen->id !== 'woocommerce_page_wc-orders' && $screen->id !== 'shop_order' ) return;
+
+	$awb_source = sawp_get_awb_source();
+	// Rulează doar dacă e curiero sau auto (ca să nu facă nimic când ai selectat altceva)
+	if ( ! in_array( $awb_source, array( 'curiero', 'auto' ), true ) ) return;
+
+	$nonce = wp_create_nonce( 'notice_sync_curiero_awb' );
+	?>
+	<script>
+		document.addEventListener('DOMContentLoaded', function () {
+			function getOrderId() {
+				try {
+					var u = new URL(location.href);
+					return u.searchParams.get('id') || u.searchParams.get('post') ||
+						(document.querySelector('input[name="post_ID"]') ? document.querySelector('input[name="post_ID"]').value : '');
+				} catch(e) { return ''; }
+			}
+
+			// caută link cu #awb=
+			var a = document.querySelector('a[href*="#awb="]');
+			if (!a) return;
+
+			var href = a.getAttribute('href') || '';
+			var m = href.match(/[#?&]awb=([^&]+)/i);
+			var awb = m ? decodeURIComponent(m[1]) : '';
+			var orderId = getOrderId();
+
+			if (!awb || !orderId) return;
+			if (typeof ajaxurl === 'undefined') return;
+
+			var fd = new FormData();
+			fd.append('action', 'notice_sync_curiero_awb');
+			fd.append('nonce', '<?php echo esc_js( $nonce ); ?>');
+			fd.append('order_id', orderId);
+			fd.append('awb', awb);
+
+			fetch(ajaxurl, { method: 'POST', body: fd })
+				.then(function(r){ return r.text(); })
+				.catch(function(){ console.warn('Nu s-a putut sincroniza AWB-ul Curiero.'); });
+		});
+	</script>
+	<?php
+}
+
+/**
+ * AJAX handler: salvează AWB (din link #awb=) în meta _notice_awb.
+ */
+add_action( 'wp_ajax_notice_sync_curiero_awb', 'notice_sync_curiero_awb' );
+function notice_sync_curiero_awb() {
+	if ( ! current_user_can( 'manage_woocommerce' ) && ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'error' => 'no_permission' ) );
+	}
+
+	check_ajax_referer( 'notice_sync_curiero_awb', 'nonce' );
+
+	$order_id = isset( $_POST['order_id'] ) ? absint( $_POST['order_id'] ) : 0;
+	$awb      = isset( $_POST['awb'] ) ? sanitize_text_field( wp_unslash( $_POST['awb'] ) ) : '';
+
+	if ( ! $order_id || '' === $awb ) {
+		wp_send_json_error( array( 'error' => 'missing_data' ) );
+	}
+
+	$awb = sawp_normalize_awb( $awb );
+
+	// Sameday-style: alfanumeric (ex: 1GAV...)
+	if ( ! preg_match( '/^[A-Z0-9]{8,30}$/', $awb ) ) {
+		wp_send_json_error( array( 'error' => 'invalid_awb' ) );
+	}
+
+	$awb_source = sawp_get_awb_source();
+	if ( ! in_array( $awb_source, array( 'curiero', 'auto' ), true ) ) {
+		wp_send_json_error( array( 'error' => 'source_not_curiero' ) );
+	}
+
+	$order = wc_get_order( $order_id );
+	if ( ! $order ) {
+		wp_send_json_error( array( 'error' => 'no_order' ) );
+	}
+
+	$existing = (string) $order->get_meta( '_notice_awb' );
+
+	// în Auto nu suprascriem dacă există deja ceva
+	if ( 'auto' === $awb_source && $existing !== '' ) {
+		wp_send_json_success( array( 'saved' => $existing, 'status' => 'auto_kept_existing' ) );
+	}
+
+	if ( $existing === $awb ) {
+		wp_send_json_success( array( 'saved' => $existing, 'status' => 'already_set' ) );
+	}
+
+	$order->update_meta_data( '_notice_awb', $awb );
+	$order->add_order_note( sprintf( 'AWB (Curiero/link #awb) setat automat: %s', $awb ) );
+	$order->save();
+
+	wp_send_json_success( array( 'saved' => $awb, 'status' => 'updated' ) );
 }
