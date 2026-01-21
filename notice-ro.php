@@ -4220,4 +4220,3 @@ function notice_sync_curiero_awb() {
 
 	wp_send_json_success( array( 'saved' => $awb, 'status' => 'updated', 'order_id' => $order_id ) );
 }
-
