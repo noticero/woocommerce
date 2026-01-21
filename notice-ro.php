@@ -4009,16 +4009,14 @@ function sawp_detect_awb_from_curiero_meta( $meta_id, $post_id, $meta_key, $meta
 	}
 
 	$existing = (string) $order->get_meta( '_notice_awb' );
-	// În Auto nu suprascriem un AWB deja setat.
 	if ( 'auto' === $awb_source && $existing !== '' ) {
 		return;
 	}
 
 	$key_l = strtolower( (string) $meta_key );
 
-	// Chei tipice Curiero: awb_fan, awb_sameday, awb_dpd, awb_urgent_cargus, awb_gls, awb_mygls, awb_bookurier, awb_innoship, awb_memex, awb_optimus_id etc.
+	// Chei tipice Curiero: awb_fan, awb_sameday, awb_dpd etc.
 	$is_curiero_key = ( strpos( $key_l, 'awb_' ) === 0 ) || ( strpos( $key_l, 'curiero' ) !== false );
-
 	if ( ! $is_curiero_key ) {
 		return;
 	}
@@ -4042,72 +4040,136 @@ function sawp_detect_awb_from_curiero_meta( $meta_id, $post_id, $meta_key, $meta
 
 	$candidate = sawp_normalize_awb( $candidate );
 
-	// Curiero poate avea AWB numeric sau alfanumeric, deci validare mai permisivă.
+	// Curiero poate avea AWB numeric sau alfanumeric
 	if ( ! preg_match( '/^[A-Z0-9]{6,30}$/', $candidate ) ) {
 		return;
 	}
 
 	$order->update_meta_data( '_notice_awb', $candidate );
-	$order->add_order_note( sprintf( 'AWB (Curiero) setat automat: %s', $candidate ) );
+	$order->add_order_note( sprintf( 'AWB (Curiero/meta) setat automat: %s', $candidate ) );
 	$order->save();
 }
 
+
 /**
- * Sync AWB din link-uri de tip ...#awb=XXXX (ex: Curiero/Sameday UI) în _notice_awb
+ * 4b) Sync AWB din LISTA HPOS (wc-orders): ia AWB din textul rândului (<tr>) și salvează în _notice_awb.
+ * Fix-ul care îți lipsea, pentru că în listă NU există link <a href="#awb=">.
  */
-add_action( 'admin_footer', 'notice_sync_curiero_awb_from_link' );
-function notice_sync_curiero_awb_from_link() {
+add_action( 'admin_footer', 'notice_sync_curiero_awb_from_hpos_list' );
+function notice_sync_curiero_awb_from_hpos_list() {
 	if ( ! function_exists( 'get_current_screen' ) ) return;
 	$screen = get_current_screen();
 	if ( ! $screen ) return;
 
-	// Woo orders (HPOS) sau comanda clasică
-	if ( $screen->id !== 'woocommerce_page_wc-orders' && $screen->id !== 'shop_order' ) return;
+	// Acceptăm variații (HPOS list / clasic)
+	$is_orders_list = ( strpos( (string) $screen->id, 'wc-orders' ) !== false ) || ( $screen->id === 'woocommerce_page_wc-orders' );
+	if ( ! $is_orders_list ) return;
 
 	$awb_source = sawp_get_awb_source();
-	// Rulează doar dacă e curiero sau auto (ca să nu facă nimic când ai selectat altceva)
 	if ( ! in_array( $awb_source, array( 'curiero', 'auto' ), true ) ) return;
 
 	$nonce = wp_create_nonce( 'notice_sync_curiero_awb' );
 	?>
 	<script>
-		document.addEventListener('DOMContentLoaded', function () {
-			function getOrderId() {
-				try {
-					var u = new URL(location.href);
-					return u.searchParams.get('id') || u.searchParams.get('post') ||
-						(document.querySelector('input[name="post_ID"]') ? document.querySelector('input[name="post_ID"]').value : '');
-				} catch(e) { return ''; }
-			}
+	document.addEventListener('DOMContentLoaded', function () {
+		// Regex-ul tău (din consolă) – prinde 1GAV...
+		var AWB_RE = /\b1GAV[A-Z0-9]{8,25}\b/g;
 
-			// caută link cu #awb=
-			var a = document.querySelector('a[href*="#awb="]');
-			if (!a) return;
+		function getOrderIdFromRow(tr) {
+			if (!tr) return null;
+			return tr.dataset.id ||
+				tr.dataset.orderId ||
+				(tr.id && (tr.id.match(/order-(\d+)/) || [])[1]) ||
+				null;
+		}
 
-			var href = a.getAttribute('href') || '';
-			var m = href.match(/[#?&]awb=([^&]+)/i);
-			var awb = m ? decodeURIComponent(m[1]) : '';
-			var orderId = getOrderId();
+		function getAwbFromRow(tr) {
+			if (!tr) return null;
+			var txt = (tr.innerText || '').toString();
+			var m = txt.match(AWB_RE);
+			return (m && m[0]) ? m[0] : null;
+		}
 
-			if (!awb || !orderId) return;
+		// Throttle + dedupe (să nu trimită de 10 ori pentru același orderId+awb)
+		var sent = new Set();
+		var queue = [];
+		var running = false;
+
+		function enqueue(orderId, awb) {
+			var key = orderId + '|' + awb;
+			if (sent.has(key)) return;
+			sent.add(key);
+			queue.push({orderId: orderId, awb: awb});
+			runQueue();
+		}
+
+		function runQueue() {
+			if (running) return;
+			if (!queue.length) return;
 			if (typeof ajaxurl === 'undefined') return;
+
+			running = true;
+			var item = queue.shift();
 
 			var fd = new FormData();
 			fd.append('action', 'notice_sync_curiero_awb');
 			fd.append('nonce', '<?php echo esc_js( $nonce ); ?>');
-			fd.append('order_id', orderId);
-			fd.append('awb', awb);
+			fd.append('order_id', item.orderId);
+			fd.append('awb', item.awb);
 
 			fetch(ajaxurl, { method: 'POST', body: fd })
-				.then(function(r){ return r.text(); })
-				.catch(function(){ console.warn('Nu s-a putut sincroniza AWB-ul Curiero.'); });
+				.then(function(r){ return r.json().catch(function(){ return null; }); })
+				.then(function(resp){
+					// Debug util în consolă:
+					console.log('[Notice] Sync Curiero AWB', item, resp);
+				})
+				.catch(function(){
+					console.warn('[Notice] Nu s-a putut sincroniza AWB-ul Curiero pentru', item);
+				})
+				.finally(function(){
+					running = false;
+					// mic delay între requesturi
+					setTimeout(runQueue, 250);
+				});
+		}
+
+		function scanVisibleRows() {
+			var rows = document.querySelectorAll('tr[id^="order-"], tr[data-id]');
+			rows.forEach(function(tr){
+				var id = getOrderIdFromRow(tr);
+				var awb = getAwbFromRow(tr);
+				if (id && awb) enqueue(id, awb);
+			});
+		}
+
+		// 1) scan la încărcare
+		scanVisibleRows();
+
+		// 2) dacă AWB-ul apare după ce apeși “Generează AWB” (AJAX UI), îl prindem cu MutationObserver
+		var obs = new MutationObserver(function(){
+			// re-scan cu debounce simplu
+			clearTimeout(window.__noticeCurieroScanT);
+			window.__noticeCurieroScanT = setTimeout(scanVisibleRows, 300);
 		});
+		obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+		// 3) și când dai paginare / filtre (uneori re-randează tabelul)
+		document.addEventListener('click', function(e){
+			var t = e.target;
+			if (!t) return;
+			if (t.closest('.tablenav-pages') || t.closest('.woocommerce-pagination') || t.closest('button') || t.closest('a')) {
+				clearTimeout(window.__noticeCurieroScanT2);
+				window.__noticeCurieroScanT2 = setTimeout(scanVisibleRows, 600);
+			}
+		}, true);
+	});
 	</script>
 	<?php
 }
 
+
 /**
- * AJAX handler: salvează AWB (din link #awb=) în meta _notice_awb.
+ * AJAX handler: salvează AWB Curiero în meta _notice_awb.
  */
 add_action( 'wp_ajax_notice_sync_curiero_awb', 'notice_sync_curiero_awb' );
 function notice_sync_curiero_awb() {
@@ -4121,24 +4183,24 @@ function notice_sync_curiero_awb() {
 	$awb      = isset( $_POST['awb'] ) ? sanitize_text_field( wp_unslash( $_POST['awb'] ) ) : '';
 
 	if ( ! $order_id || '' === $awb ) {
-		wp_send_json_error( array( 'error' => 'missing_data' ) );
+		wp_send_json_error( array( 'error' => 'missing_data', 'order_id' => $order_id, 'awb' => $awb ) );
 	}
 
 	$awb = sawp_normalize_awb( $awb );
 
-	// Sameday-style: alfanumeric (ex: 1GAV...)
-	if ( ! preg_match( '/^[A-Z0-9]{8,30}$/', $awb ) ) {
-		wp_send_json_error( array( 'error' => 'invalid_awb' ) );
+	// Permisiv: Curiero poate avea AWB diferit (numeric/alfanumeric). Sameday-style e alfanumeric.
+	if ( ! preg_match( '/^[A-Z0-9]{6,30}$/', $awb ) ) {
+		wp_send_json_error( array( 'error' => 'invalid_awb', 'awb' => $awb ) );
 	}
 
 	$awb_source = sawp_get_awb_source();
 	if ( ! in_array( $awb_source, array( 'curiero', 'auto' ), true ) ) {
-		wp_send_json_error( array( 'error' => 'source_not_curiero' ) );
+		wp_send_json_error( array( 'error' => 'source_not_curiero', 'source' => $awb_source ) );
 	}
 
 	$order = wc_get_order( $order_id );
 	if ( ! $order ) {
-		wp_send_json_error( array( 'error' => 'no_order' ) );
+		wp_send_json_error( array( 'error' => 'no_order', 'order_id' => $order_id ) );
 	}
 
 	$existing = (string) $order->get_meta( '_notice_awb' );
@@ -4153,8 +4215,9 @@ function notice_sync_curiero_awb() {
 	}
 
 	$order->update_meta_data( '_notice_awb', $awb );
-	$order->add_order_note( sprintf( 'AWB (Curiero/link #awb) setat automat: %s', $awb ) );
+	$order->add_order_note( sprintf( 'AWB (Curiero/listă HPOS) setat automat: %s', $awb ) );
 	$order->save();
 
-	wp_send_json_success( array( 'saved' => $awb, 'status' => 'updated' ) );
+	wp_send_json_success( array( 'saved' => $awb, 'status' => 'updated', 'order_id' => $order_id ) );
 }
+
