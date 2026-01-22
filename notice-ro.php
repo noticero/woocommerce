@@ -4167,6 +4167,98 @@ function notice_sync_curiero_awb_from_hpos_list() {
 	<?php
 }
 
+ 
+ 
+/* ================== DETECTIE PRECIZA AWB SAMEDAY DIN DATA-ATTRIBUTE ================== */
+
+add_action('admin_footer', 'sawp_detect_awb_by_attribute');
+function sawp_detect_awb_by_attribute() {
+    if (!function_exists('get_current_screen')) return;
+    $screen = get_current_screen();
+    if (!$screen || !in_array($screen->id, ['shop_order', 'woocommerce_page_wc-orders', 'edit-shop_order'])) return;
+
+    $order_id = (isset($_GET['id'])) ? absint($_GET['id']) : ((isset($_GET['post'])) ? absint($_GET['post']) : 0);
+    if (!$order_id) return;
+
+    $nonce = wp_create_nonce('sawp_save_attribute_awb_' . $order_id);
+    ?>
+    <script>
+    jQuery(document).ready(function($) {
+        var orderId = <?php echo $order_id; ?>;
+        var ajaxNonce = '<?php echo $nonce; ?>';
+        var isAwbProcessed = false;
+
+        // Functia care extrage AWB-ul direct din atributul data-awb-number
+        function extractAwbFromAttribute() {
+            if (isAwbProcessed) return;
+
+            // Cautam elementul din codul HTML pe care mi l-ai trimis
+            var $awbElement = $('.showHistoryDetails[data-awb-number]');
+
+            if ($awbElement.length > 0) {
+                var extractedAwb = $awbElement.first().data('awb-number');
+
+                if (extractedAwb && extractedAwb.length > 5) {
+                    isAwbProcessed = true; // Evitam trimiterile multiple
+                    console.log('AWB Detectat prin atribut: ' + extractedAwb);
+                    saveAwbToOrder(extractedAwb);
+                }
+            }
+        }
+
+        function saveAwbToOrder(awbValue) {
+            $.post(ajaxurl, {
+                action: 'sawp_save_attribute_awb_action',
+                order_id: orderId,
+                awb: awbValue,
+                nonce: ajaxNonce
+            }, function(response) {
+                if (response.success) {
+                    // Confirmare vizuala in interfata WordPress
+                    $('#awb-save-notice').remove();
+                    $('.wrap h1:first').after('<div id="awb-save-notice" class="notice notice-success is-dismissible"><p><strong>✓ AWB Sameday salvat cu succes: ' + awbValue + '</strong>. Variabila {awb} este acum activa.</p></div>');
+                } else {
+                    isAwbProcessed = false;
+                }
+            });
+        }
+
+        // Monitorizam schimbarile in DOM (cand apare fereastra Thickbox/Awb History)
+        var observer = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                if (mutation.addedNodes.length > 0) {
+                    extractAwbFromAttribute();
+                }
+            });
+        });
+
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Verificare de siguranta la click pe orice buton de istoric
+        $(document).on('click', 'button, a, .showHistoryDetails', function() {
+            setTimeout(extractAwbFromAttribute, 1000);
+        });
+    });
+    </script>
+    <?php
+}
+
+/* Handler AJAX pentru salvarea valorii in baza de date */
+add_action('wp_ajax_sawp_save_attribute_awb_action', function() {
+    $order_id = isset($_POST['order_id']) ? absint($_POST['order_id']) : 0;
+    $awb      = isset($_POST['awb']) ? sanitize_text_field($_POST['awb']) : '';
+    $nonce    = isset($_POST['nonce']) ? $_POST['nonce'] : '';
+
+    if (wp_verify_nonce($nonce, 'sawp_save_attribute_awb_' . $order_id)) {
+        // Actualizam cheia pe care o foloseste pluginul tau de SMS
+        update_post_meta($order_id, '_notice_awb', $awb);
+        // Backup in cheia standard Sameday
+        update_post_meta($order_id, 'samedaycourier_awb_number', $awb);
+        
+        wp_send_json_success();
+    }
+    wp_send_json_error();
+});
 
 /**
  * AJAX handler: salvează AWB Curiero în meta _notice_awb.
