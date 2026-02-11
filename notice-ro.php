@@ -1,8 +1,9 @@
 <?php
+
 /**
- * Plugin Name: notice.ro
+ * Plugin Name: NoticeApp
  * Description: Trimite SMS-uri automat la schimbarea statusului unei comenzi WooCommerce folosind template-uri Notice.ro.
- * Version:     4.3.1
+ * Version:     5.0
  * Author:      Notice
  * Text Domain: notice-sms-connector
  */
@@ -1532,26 +1533,52 @@ function sawp_render_received_page() {
                                 </tr>
                             </thead>
                             <tbody>
-                                <?php foreach ($received as $sms) :
-                                    $created_disp = sawp_extract_datetime_display($sms);
-                                    $from_raw     = sawp_extract_phone_raw($sms);
-                                    $message      = sawp_extract_message($sms);
-                                    $order_id     = $from_raw ? sawp_find_order_by_phone($from_raw) : 0;
-                                    ?>
-                                    <tr>
-                                        <td><?php echo $created_disp ? esc_html($created_disp) : '—'; ?></td>
-                                        <td><?php echo $from_raw ? esc_html($from_raw) : '—'; ?></td>
-                                        <td><?php echo $message !== '' ? esc_html($message) : '—'; ?></td>
-                                        <td>
-                                            <?php
-                                            if ($order_id) {
-                                                $order_url = admin_url("post.php?post={$order_id}&action=edit");
-                                                echo '<a href="'.esc_url($order_url).'" class="sawp-link">#'.esc_html($order_id).'</a>';
-                                            } else { echo '—'; }
-                                            ?>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
+                                <?php 
+foreach ($received as $sms) :
+    $created_disp = sawp_extract_datetime_display($sms);
+    $from_raw     = sawp_extract_phone_raw($sms);
+    $message      = sawp_extract_message($sms);
+    $sms_time     = strtotime($sms['created_at']); // Timpul când a fost primit SMS-ul
+
+    // --- LOGICĂ NOUĂ PENTRU GĂSIRE ID CORECT ---
+    $order_id = 0;
+    if ($from_raw) {
+        $short_phone = substr(preg_replace('/\D+/', '', $from_raw), -9);
+        
+        global $wpdb;
+        // Căutăm comanda care a fost creată cel mai recent, dar ÎNAINTE de acest SMS
+        $order_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} pm
+             JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_billing_phone' 
+             AND pm.meta_value LIKE %s
+             AND p.post_type = 'shop_order'
+             AND p.post_date <= %s
+             ORDER BY p.post_date DESC LIMIT 1",
+            '%' . $short_phone,
+            date('Y-m-d H:i:s', $sms_time)
+        ));
+    }
+    // -------------------------------------------
+    ?>
+    <tr>
+        <td><?php echo $created_disp ? esc_html($created_disp) : '—'; ?></td>
+        <td><?php echo $from_raw ? esc_html($from_raw) : '—'; ?></td>
+        <td><?php echo $message !== '' ? esc_html($message) : '—'; ?></td>
+        <td>
+            <?php
+            if ($order_id) {
+                $order_url = admin_url("post.php?post={$order_id}&action=edit");
+                // Am adăugat și un mic indicator de status ca să fie clar
+                $order = wc_get_order($order_id);
+                $status = $order ? $order->get_status() : '';
+                echo '<a href="'.esc_url($order_url).'" class="sawp-link">#'.esc_html($order_id).'</a>';
+                echo '<div style="font-size:10px; color:#999;">('.$status.')</div>';
+            } else { echo '—'; }
+            ?>
+        </td>
+    </tr>
+<?php endforeach; ?>
                             </tbody>
                         </table>
                     </div>
@@ -3208,258 +3235,6 @@ function sawp_find_order_by_phone($phone) {
     
     return 0;
 }
-/* ================== CONFIRMARE COMENZI PRIN SMS + BADGE ================== */
-
-// Procesează SMS-urile de confirmare "Da", "DA", "da" - FĂRĂ SCHIMBAREA STATUSULUI
-function sawp_process_order_confirmation_sms($sms_data) {
-    $message = sawp_extract_message($sms_data);
-    $phone = sawp_extract_phone_raw($sms_data);
-    
-    // Verifică dacă mesajul conține confirmarea (mai flexibil)
-    $clean_message = strtolower(trim($message));
-    $confirmation_keywords = ['da', 'yes', 'DA', 'Da', 'okay'];
-    $is_confirmation = in_array($clean_message, $confirmation_keywords);
-    
-    if (!$is_confirmation || !$phone) {
-        return false; // Nu este confirmare sau nu are telefon
-    }
-    
-    $order_id = sawp_find_order_by_phone($phone);
-    
-    if (!$order_id) {
-        return false; // Nu s-a găsit comandă pentru acest telefon
-    }
-    
-    $order = wc_get_order($order_id);
-    if (!$order) {
-        return false; // Comanda nu există
-    }
-    
-    // Verifică dacă comanda nu este deja confirmată
-    $already_confirmed = $order->get_meta('_sawp_sms_confirmed') === 'yes';
-    if ($already_confirmed) {
-        return false; // Este deja confirmată
-    }
-    
-    // Marchează comanda ca confirmată prin SMS (DOAR BADGE)
-    $order->update_meta_data('_sawp_sms_confirmed', 'yes');
-    $order->update_meta_data('_sawp_sms_confirmed_at', current_time('mysql'));
-    $order->update_meta_data('_sawp_sms_confirmed_phone', $phone);
-    $order->save();
-    
-    // Adaugă o notă la comandă
-    $order->add_order_note(
-        sprintf(
-            __('Comandă confirmată prin SMS de la %s', 'notice-sms-connector'),
-            $phone
-        )
-    );
-    
-    return $order_id; // Returnează ID-ul comenzii confirmate
-}
-
-// Verifică SMS-urile pentru confirmări - DOAR MANUAL
-function sawp_check_sms_confirmations() {
-    $received_sms = get_transient('sawp_received_sms');
-    
-    if (is_array($received_sms)) {
-        foreach ($received_sms as $sms) {
-            // Verifică dacă SMS-ul a fost deja procesat
-            $sms_id = $sms['id'] ?? md5(serialize($sms));
-            $processed_key = 'sawp_processed_sms_' . $sms_id;
-            
-            if (!get_transient($processed_key)) {
-                $order_id = sawp_process_order_confirmation_sms($sms);
-                
-                if ($order_id) {
-                    // Marchează SMS-ul ca procesat (expiră după 24 de ore)
-                    set_transient($processed_key, true, 24 * HOUR_IN_SECONDS);
-                }
-            }
-        }
-    }
-}
-
-// Adaugă coloană pentru confirmare SMS în lista de comenzi
-add_filter('manage_edit-shop_order_columns', 'sawp_add_sms_confirmation_column');
-function sawp_add_sms_confirmation_column($columns) {
-    $new_columns = array();
-    
-    foreach ($columns as $key => $column) {
-        $new_columns[$key] = $column;
-        
-        // Adaugă coloana după coloana "Status"
-        if ($key === 'order_status') {
-            $new_columns['sms_confirmation'] = __('Confirmare SMS', 'notice-sms-connector');
-        }
-    }
-    
-    return $new_columns;
-}
-
-// Afișează badge-ul mov în coloană
-add_action('manage_shop_order_posts_custom_column', 'sawp_show_sms_confirmation_column');
-function sawp_show_sms_confirmation_column($column) {
-    global $post;
-    
-    if ($column === 'sms_confirmation') {
-        $order = wc_get_order($post->ID);
-        $is_confirmed = $order->get_meta('_sawp_sms_confirmed') === 'yes';
-        
-        if ($is_confirmed) {
-            echo '<span class="sawp-sms-badge" style="background: #8B5CF6; color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; display: inline-block;">';
-            echo __('Confirmat SMS', 'notice-sms-connector');
-            echo '</span>';
-            
-            // Afișează data confirmării dacă există
-            $confirmed_at = $order->get_meta('_sawp_sms_confirmed_at');
-            if ($confirmed_at) {
-                echo '<br><small style="color: #666; font-size: 10px;">';
-                echo date_i18n('d M H:i', strtotime($confirmed_at));
-                echo '</small>';
-            }
-        } else {
-            echo '<span style="color: #ccc;">—</span>';
-        }
-    }
-}
-
-// Adaugă buton în bara de acțiuni din pagina de comenzi
-add_action('restrict_manage_posts', 'sawp_add_check_sms_button_orders_page');
-function sawp_add_check_sms_button_orders_page($post_type) {
-    if ($post_type === 'shop_order') {
-        echo '<button type="button" id="sawp-check-sms-confirmations" class="button" style="margin-left: 10px;">';
-        echo '<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> ';
-        echo __('Verifică confirmări SMS', 'notice-sms-connector');
-        echo '</button>';
-        
-        // Script pentru buton
-        echo '<script>
-        jQuery(document).ready(function($) {
-            $("#sawp-check-sms-confirmations").on("click", function() {
-                var $btn = $(this);
-                $btn.prop("disabled", true).text("Se verifică...");
-                
-                $.post(ajaxurl, {
-                    action: "sawp_check_sms_confirmations_ajax",
-                    nonce: "' . wp_create_nonce('sawp_check_sms_confirmations') . '"
-                }, function(response) {
-                    if (response.success) {
-                        alert("Verificare completă! " + response.data.message);
-                        location.reload(); // Reîncarcă pentru a afișa noile badge-uri
-                    } else {
-                        alert("Eroare: " + response.data);
-                    }
-                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
-                }).fail(function() {
-                    alert("Eroare la comunicarea cu serverul.");
-                    $btn.prop("disabled", false).html(\'<span class="dashicons dashicons-email-alt" style="margin-top: 3px;"></span> Verifică confirmări SMS\');
-                });
-            });
-        });
-        </script>';
-    }
-}
-
-// Handler AJAX pentru verificarea confirmărilor - FĂRĂ SCHIMBAREA STATUSULUI
-add_action('wp_ajax_sawp_check_sms_confirmations_ajax', 'sawp_check_sms_confirmations_ajax_handler');
-function sawp_check_sms_confirmations_ajax_handler() {
-    check_ajax_referer('sawp_check_sms_confirmations', 'nonce');
-    
-    if (!current_user_can('manage_woocommerce')) {
-        wp_send_json_error('Permisiune insuficientă.');
-    }
-    
-    // Forțează reîmprospătarea SMS-urilor primite
-    delete_transient('sawp_received_sms');
-    
-    // Reîncarcă SMS-urile de la API
-    $opts = get_option('sawp_opts', []);
-    $token = trim($opts['token'] ?? '');
-    
-    if (!$token) {
-        wp_send_json_error('Token API nu este setat.');
-    }
-    
-    $response = wp_remote_get('https://api.notice.ro/api/v1/sms-in', [
-        'headers' => [
-            'Authorization' => 'Bearer ' . $token,
-            'Content-Type'  => 'application/json',
-            'Accept'        => 'application/json'
-        ],
-        'timeout' => 15
-    ]);
-    
-    if (is_wp_error($response)) {
-        wp_send_json_error('Eroare la preluarea SMS-urilor: ' . $response->get_error_message());
-    }
-    
-    $body = json_decode(wp_remote_retrieve_body($response), true);
-    $data = [];
-    
-    if (is_array($body)) {
-        if (isset($body['data']) && is_array($body['data'])) { 
-            $data = $body['data']; 
-        } elseif (isset($body[0])) { 
-            $data = $body; 
-        }
-    }
-    
-    set_transient('sawp_received_sms', $data, 15 * MINUTE_IN_SECONDS);
-    set_transient('sawp_received_last_update', time(), 15 * MINUTE_IN_SECONDS);
-    
-    // Procesează confirmările - FĂRĂ SCHIMBAREA STATUSULUI
-    $confirmed_count = 0;
-    $total_sms = count($data);
-    
-    if (is_array($data)) {
-        foreach ($data as $sms) {
-            $order_id = sawp_process_order_confirmation_sms($sms);
-            if ($order_id) {
-                $confirmed_count++; // Numără doar comenzile confirmate cu succes
-            }
-        }
-    }
-    
-    wp_send_json_success([
-        'message' => sprintf(
-            __('S-au procesat %d SMS-uri. %d comenzi confirmate prin SMS.', 'notice-sms-connector'), 
-            $total_sms, 
-            $confirmed_count
-        ),
-        'confirmed' => $confirmed_count,
-        'total_sms' => $total_sms
-    ]);
-}
-
-// Adaugă CSS pentru badge-uri și buton
-add_action('admin_head', 'sawp_sms_confirmation_styles');
-function sawp_sms_confirmation_styles() {
-    ?>
-    <style>
-    .sawp-sms-badge {
-        background: #8B5CF6 !important;
-        color: white !important;
-        padding: 4px 8px !important;
-        border-radius: 12px !important;
-        font-size: 11px !important;
-        font-weight: bold !important;
-        display: inline-block !important;
-        text-transform: uppercase !important;
-        letter-spacing: 0.5px !important;
-    }
-    
-    .column-sms_confirmation {
-        width: 120px !important;
-        text-align: center !important;
-    }
-    
-    #sawp-check-sms-confirmations .dashicons {
-        margin-right: 4px;
-    }
-    </style>
-    <?php
-}
 
 
 /* ------------------------------------------------------------
@@ -3488,16 +3263,26 @@ if ( ! function_exists( 'sawp_normalize_awb' ) ) {
 if ( ! function_exists( 'sawp_get_awb_source' ) ) {
 	function sawp_get_awb_source() {
 		$allowed = array( 'auto', 'colete', 'sameday', 'fan', 'curiero' );
-		$val     = get_option( 'notice_awb_source', 'auto' );
 
-		$val = is_string( $val ) ? strtolower( trim( $val ) ) : 'auto';
+		// IMPORTANT: default = '' (nimic selectat)
+		$val = get_option( 'notice_awb_source', '' );
+
+		$val = is_string( $val ) ? strtolower( trim( $val ) ) : '';
+
+		// dacă nu e selectat nimic, returnăm '' (nu forțăm auto)
+		if ( $val === '' ) {
+			return '';
+		}
+
+		// dacă e setat, validăm
 		if ( ! in_array( $val, $allowed, true ) ) {
-			$val = 'auto';
+			return '';
 		}
 
 		return $val;
 	}
 }
+
 
 /**
  * 1) Înregistrăm câmpul în pagina de setări (dar salvăm cu AJAX).
@@ -3552,20 +3337,21 @@ function sawp_field_awb_source_pro() {
 
 	$choices = array(
 		'auto'   => array(
-			'label' => 'Auto',
-			'desc'  => 'Detectează automat din toate integrările compatibile. Primul AWB găsit este folosit.',
-			'logo'  => '',
+			'label' => 'Sameday',
+			'desc'  => 'Folosește exclusiv AWB-urile din pluginul Sameday.',
+			'logo'  => $logo_sd,
 		),
 		'colete' => array(
 			'label' => 'Colete-Online',
 			'desc'  => 'Folosește exclusiv AWB-urile din pluginul Colete-Online.',
 			'logo'  => $logo_co,
 		),
-		'sameday' => array(
+	/**
+ * 	'sameday' => array(
 			'label' => 'Sameday',
 			'desc'  => 'Folosește exclusiv AWB-urile din pluginul Sameday.',
 			'logo'  => $logo_sd,
-		),
+		),*/
 		'fan'    => array(
 			'label' => 'FAN Courier',
 			'desc'  => 'Folosește exclusiv AWB-urile din integrările FAN Courier (selfAWB / plugin WooCommerce).',
@@ -3591,7 +3377,7 @@ function sawp_field_awb_source_pro() {
 			.sawp-awb-source-grid {
 				display: flex;
 				flex-wrap: wrap;
-				gap: 16px;
+				gap: 6px;
 				margin-top: 4px;
 			}
 			.sawp-awb-card {
@@ -3695,22 +3481,30 @@ function sawp_field_awb_source_pro() {
 
 	echo '<div class="sawp-awb-source-grid">';
 
-	foreach ( $choices as $key => $choice ) {
-		$is_active = ( $val === $key ) ? ' is-active' : '';
-		echo '<label class="sawp-awb-card' . esc_attr( $is_active ) . '">';
-		// folosim opțiune separată, nu array-ul sawp_opts
-		echo '<input type="radio" name="notice_awb_source_fake" value="' . esc_attr( $key ) . '" ' . checked( $val, $key, false ) . ' />';
-		echo '<div class="sawp-awb-card-body">';
+foreach ( $choices as $key => $choice ) {
 
-		if ( ! empty( $choice['logo'] ) ) {
-			echo '<img class="sawp-awb-card-logo" src="' . esc_url( $choice['logo'] ) . '" alt="' . esc_attr( $choice['label'] ) . '" />';
-		}
+    // dacă $val e gol ('' / null) => NU bifează nimic
+    $checked   = ( ! empty( $val ) && $val === $key );
+    $is_active = $checked ? ' is-active' : '';
 
-		echo '<div class="sawp-awb-card-title">' . esc_html( $choice['label'] ) . '</div>';
-		echo '<p class="sawp-awb-card-desc">' . esc_html( $choice['desc'] ) . '</p>';
-		echo '</div>';
-		echo '</label>';
-	}
+    echo '<label class="sawp-awb-card' . esc_attr( $is_active ) . '">';
+
+    echo '<input type="radio" name="notice_awb_source_fake" value="' . esc_attr( $key ) . '" '
+        . ( $checked ? 'checked="checked"' : '' ) . ' />';
+
+    echo '<div class="sawp-awb-card-body">';
+
+    if ( ! empty( $choice['logo'] ) ) {
+        echo '<img class="sawp-awb-card-logo" src="' . esc_url( $choice['logo'] ) . '" alt="' . esc_attr( $choice['label'] ) . '" />';
+    }
+
+    echo '<div class="sawp-awb-card-title">' . esc_html( $choice['label'] ) . '</div>';
+    echo '<p class="sawp-awb-card-desc">' . esc_html( $choice['desc'] ) . '</p>';
+
+    echo '</div>';
+    echo '</label>';
+}
+
 
 	echo '</div>';
 	echo '<p class="description">';
@@ -4312,3 +4106,662 @@ function notice_sync_curiero_awb() {
 
 	wp_send_json_success( array( 'saved' => $awb, 'status' => 'updated', 'order_id' => $order_id ) );
 }
+
+
+/**
+ * Override "Test conexiune" ca să NU mai trimită request-uri invalide către /sms-out.
+ * În loc de asta verifică tokenul cu GET /user/units (safe).
+ */
+add_action('admin_init', function () {
+    // Înlocuiește callback-ul câmpului sawp_test cu unul "safe"
+    if (function_exists('remove_settings_field') && function_exists('add_settings_field')) {
+        remove_settings_field('sawp_test', 'sawp-settings', 'sawp_main');
+
+        add_settings_field(
+            'sawp_test',
+            '<span class="dashicons dashicons-admin-site-alt3"></span> Test conexiune',
+            'sawp_field_test_safe',
+            'sawp-settings',
+            'sawp_main'
+        );
+    }
+}, 99);
+
+function sawp_field_test_safe() {
+    $opts  = get_option('sawp_opts', []);
+    $token = trim($opts['token'] ?? '');
+
+    if (!$token) {
+        echo '<span class="sawp-test-error">Token nu este setat.</span>';
+        return;
+    }
+
+    $res = wp_remote_get('https://api.notice.ro/api/v1/user/units', [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $token,
+            'Accept'        => 'application/json',
+        ],
+        'timeout' => 15,
+    ]);
+
+    if (is_wp_error($res)) {
+        echo '<span class="sawp-test-error">Eroare: ' . esc_html($res->get_error_message()) . '</span>';
+        return;
+    }
+
+    $code = (int) wp_remote_retrieve_response_code($res);
+    $body = (string) wp_remote_retrieve_body($res);
+
+    if ($code === 200) {
+        // (opțional) afișează rapid creditele rămase dacă există în răspuns
+        $data = json_decode($body, true);
+        $extra = '';
+
+        if (is_array($data)) {
+            $rem = null;
+            if (isset($data['credits']) && is_array($data['credits'])) {
+                $rem = $data['credits']['remaining'] ?? $data['credits']['remaining_credits'] ?? null;
+            } else {
+                $rem = $data['remaining_credits'] ?? $data['remaining'] ?? $data['credits_remaining'] ?? null;
+            }
+            if ($rem !== null) {
+                $extra = ' <small>(credite: ' . esc_html((string) $rem) . ')</small>';
+            }
+        }
+
+        echo '<span class="sawp-test-success">Conexiune OK</span>' . $extra;
+        return;
+    }
+
+    if ($code === 401 || $code === 403) {
+        echo '<span class="sawp-test-error">Token invalid sau fără permisiuni (' . esc_html((string) $code) . ').</span>';
+        return;
+    }
+
+    echo '<span class="sawp-test-error">Eroare (' . esc_html((string) $code) . '): ' . esc_html($body) . '</span>';
+}
+
+
+/**************************************************
+ * NORMALIZARE NUMĂR TELEFON
+ **************************************************/
+function sawp_normalize_phone_strict($phone) {
+    if (!$phone) return '';
+    
+    $phone = preg_replace('/\D+/', '', $phone);
+    
+    if (strpos($phone, '0040') === 0) $phone = substr($phone, 4);
+    elseif (strpos($phone, '+40') === 0)  $phone = substr($phone, 3);
+    elseif (strpos($phone, '40') === 0)   $phone = substr($phone, 2);
+    
+    if (preg_match('/^7[0-9]{8}$/', $phone)) $phone = '0' . $phone;
+    
+    if (!preg_match('/^0[0-9]{9}$/', $phone)) return '';
+    
+    return $phone;
+}
+
+/**************************************************
+ * GĂSIRE TOATE COMENZILE DUPA TELEFON - IMBUNATATITA
+ **************************************************/
+function sawp_find_orders_by_phone($phone) {
+    $phone = sawp_normalize_phone_strict($phone);
+    if (!$phone) return [];
+
+    // Caută în toate comenzile WooCommerce
+    $orders = wc_get_orders([
+        'limit'  => 100, // Mărim limita
+        'type'   => 'shop_order',
+        'status' => array('wc-pending', 'wc-processing', 'wc-on-hold', 'wc-completed', 'wc-cancelled', 'wc-refunded', 'wc-failed'),
+        'return' => 'ids',
+        'orderby' => 'date',
+        'order'   => 'DESC'
+    ]);
+
+    $found_orders = [];
+
+    foreach ($orders as $order_id) {
+        $order = wc_get_order($order_id);
+        if (!$order) continue;
+
+        // Verifică telefoanele din billing și shipping
+        $billing_phone = $order->get_billing_phone();
+        $shipping_phone = $order->get_shipping_phone();
+        
+        $billing_normalized = sawp_normalize_phone_strict($billing_phone);
+        $shipping_normalized = sawp_normalize_phone_strict($shipping_phone);
+
+        if ($billing_normalized === $phone || $shipping_normalized === $phone) {
+            $found_orders[] = $order_id;
+        }
+    }
+
+    return $found_orders;
+}
+
+
+
+
+/**************************************************
+ * BUTON REIMPROSPĂTARE
+ **************************************************/
+add_action('admin_head', function() {
+    $screen = get_current_screen();
+    if (!$screen || $screen->id !== 'woocommerce_page_wc-orders') return;
+    
+    $nonce = wp_create_nonce('sawp_refresh_orders_nonce');
+    ?>
+
+    <?php
+});
+
+/**************************************************
+ * PROCESARE REIMPROSPĂTARE
+ **************************************************/
+add_action('admin_init', function() {
+    if (isset($_POST['sawp_refresh_orders']) && $_POST['sawp_refresh_orders'] === '1') {
+        if (!isset($_POST['sawp_refresh_orders_nonce']) || 
+            !wp_verify_nonce($_POST['sawp_refresh_orders_nonce'], 'sawp_refresh_orders_nonce')) {
+            wp_die('Nonce invalid.');
+        }
+        
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die('Nu aveți permisiuni.');
+        }
+        
+        if (function_exists('sawp_fetch_received')) {
+            sawp_fetch_received();
+        }
+        
+        wp_redirect(admin_url('admin.php?page=wc-orders'));
+        exit;
+    }
+});
+
+/**************************************************
+ * MODIFICARE PAGINA SMS-URI PENTRU AFIȘARE CORECTĂ A DATEI
+ **************************************************/
+
+// Suprascrie afișarea tabelului SMS-uri pentru a include data corectă
+add_action('admin_init', function() {
+    // Verifică dacă suntem în pagina SMS-urilor
+    if (isset($_GET['page']) && strpos($_GET['page'], 'sawp') !== false) {
+        // Adaugă acțiunea pentru a modifica afișarea tabelului
+        add_action('sawp_sms_received_table_header', function() {
+            echo '<th>Data primirii</th>';
+        });
+        
+        add_action('sawp_sms_received_table_row', function($sms) {
+            echo '<td>';
+            // Afișează data din SMS, nu data curentă
+            if (isset($sms['created_at'])) {
+                $date = strtotime($sms['created_at']);
+                echo date('d M Y H:i', $date);
+            } else {
+                echo 'N/A';
+            }
+            echo '</td>';
+        });
+    }
+});
+
+/**************************************************
+ * CORECTARE FUNCȚIE LOAD MORE PENTRU DATA CORECTĂ
+ **************************************************/
+add_action('wp_ajax_sawp_load_more_sms', function() {
+    check_ajax_referer('sawp_load_more', 'nonce');
+    
+    $page = absint($_POST['page'] ?? 1);
+    $per_page = 15;
+    
+    $all_sms = get_transient('sawp_received_sms') ?: [];
+    $total_sms = count($all_sms);
+    $total_pages = ceil($total_sms / $per_page);
+    
+    $sms_page = array_slice($all_sms, ($page - 1) * $per_page, $per_page);
+    
+    ob_start();
+    foreach ($sms_page as $sms) {
+        echo '<tr>';
+        
+        // COLONA DATA - CORECTATĂ
+        echo '<td>';
+        if (isset($sms['created_at'])) {
+            $date = strtotime($sms['created_at']);
+            echo date('d M Y H:i', $date);
+        } else {
+            echo 'N/A';
+        }
+        echo '</td>';
+        
+        // Celelalte coloane...
+        echo '<td>' . (isset($sms['phone']) ? $sms['phone'] : 'N/A') . '</td>';
+        echo '<td>' . (isset($sms['message']) ? $sms['message'] : '') . '</td>';
+        
+        // Coloana cu comanda
+        echo '<td>';
+        if (function_exists('sawp_extract_phone_raw')) {
+            $raw_phone = sawp_extract_phone_raw($sms);
+            $phone = sawp_normalize_phone_strict($raw_phone);
+            $order_ids = sawp_find_orders_by_phone($phone);
+            
+            if (!empty($order_ids)) {
+                echo '<div style="display: flex; flex-direction: column; gap: 2px;">';
+                foreach (array_slice($order_ids, 0, 3) as $order_id) {
+                    $order = wc_get_order($order_id);
+                    $confirmed = $order && $order->get_meta('_sawp_sms_confirmed') === 'yes' ? '✅' : '❌';
+                    echo '<small>';
+                    echo '<a href="' . admin_url("admin.php?page=wc-orders&action=edit&id={$order_id}") . '" target="_blank">';
+                    echo '#' . $order_id . ' ' . $confirmed;
+                    echo '</a>';
+                    echo '</small>';
+                }
+                if (count($order_ids) > 3) {
+                    echo '<small style="color: #666;">+ ' . (count($order_ids) - 3) . ' mai multe</small>';
+                }
+                echo '</div>';
+            } else {
+                echo '<span style="color: #ccc;">—</span>';
+            }
+        }
+        echo '</td>';
+        echo '</tr>';
+    }
+    $html = ob_get_clean();
+    
+    wp_send_json_success([
+        'html' => $html,
+        'has_more' => $page < $total_pages,
+        'page' => $page,
+        'total_pages' => $total_pages
+    ]);
+});
+
+/**************************************************
+ * VERIFICARE ȘI REPARARE STRUCTURĂ DATE SMS
+ **************************************************/
+add_action('admin_init', function() {
+    // Verifică și repară structura datelor SMS dacă este necesar
+    $received_sms = get_transient('sawp_received_sms');
+    if (is_array($received_sms)) {
+        $needs_fix = false;
+        foreach ($received_sms as $sms_id => $sms) {
+            // Dacă SMS-ul nu are dată, adaugă data curentă
+            if (!isset($sms['created_at']) || empty($sms['created_at'])) {
+                $received_sms[$sms_id]['created_at'] = current_time('mysql');
+                $needs_fix = true;
+            }
+        }
+        
+        if ($needs_fix) {
+            set_transient('sawp_received_sms', $received_sms, 12 * HOUR_IN_SECONDS);
+        }
+    }
+});
+
+/**************************************************
+ * FUNCȚIE DE DEBUG PENTRU VERIFICARE DATE SMS
+ **************************************************/
+function sawp_debug_sms_data() {
+    if (!current_user_can('manage_woocommerce')) return;
+    
+    $received_sms = get_transient('sawp_received_sms');
+    if (is_array($received_sms) && !empty($received_sms)) {
+        error_log('=== SAWP SMS DEBUG ===');
+        foreach ($received_sms as $sms_id => $sms) {
+            error_log('SMS ID: ' . $sms_id);
+            error_log('Data: ' . ($sms['created_at'] ?? 'N/A'));
+            error_log('Telefon: ' . ($sms['phone'] ?? 'N/A'));
+            error_log('Mesaj: ' . ($sms['message'] ?? 'N/A'));
+            error_log('---');
+        }
+        error_log('=====================');
+    }
+}
+
+// Adaugă buton de debug în admin (opțional)
+add_action('admin_head', function() {
+    if (isset($_GET['debug_sms']) && $_GET['debug_sms'] === '1' && current_user_can('manage_woocommerce')) {
+        sawp_debug_sms_data();
+        echo '<div class="notice notice-info"><p>Datele SMS au fost logate. Verifică consola de erori.</p></div>';
+    }
+});
+
+// Buton debug (opțional)
+add_action('admin_head', function() {
+    $screen = get_current_screen();
+    if (!$screen || strpos($screen->id, 'sawp') === false) return;
+    
+    ?>
+    <script>
+    jQuery(document).ready(function($) {
+        $('.wrap h1').after(
+            '<a href="<?php echo add_query_arg('debug_sms', '1'); ?>" class="button button-secondary" style="margin-left: 10px;">Debug SMS Data</a>'
+        );
+    });
+    </script>
+    <?php
+});
+
+/**************************************************
+ * HPOS COMPATIBILITATE
+ **************************************************/
+add_action('before_woocommerce_init', function() {
+    if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+            'custom_order_tables', __FILE__, true
+        );
+    }
+});
+
+
+
+/**************************************************
+ * AFIȘARE SMS - ASOCIERE PRIN TIMPUL CREĂRII (FINAL)
+ **************************************************/
+
+add_filter('manage_edit-shop_order_columns', 'sawp_add_sms_final_v12');
+add_filter('manage_woocommerce_page_wc-orders_columns', 'sawp_add_sms_final_v12');
+function sawp_add_sms_final_v12($columns) {
+    $new_columns = array();
+    foreach ($columns as $key => $column) {
+        $new_columns[$key] = $column;
+        if ('order_number' === $key) $new_columns['sawp_sms_resp'] = 'Răspuns SMS';
+    }
+    return $new_columns;
+}
+
+add_action('manage_shop_order_posts_custom_column', 'sawp_display_sms_final_v12', 10, 2);
+add_action('manage_woocommerce_page_wc-orders_custom_column', 'sawp_display_sms_final_v12', 10, 2);
+function sawp_display_sms_final_v12($column, $order) {
+    if ('sawp_sms_resp' !== $column) return;
+
+    if (is_numeric($order)) { $order = wc_get_order($order); }
+    if (!$order) return;
+
+    $order_id = $order->get_id();
+    $order_phone = preg_replace('/\D+/', '', $order->get_billing_phone());
+    $short_phone = substr($order_phone, -9);
+    
+    // Data creării comenzii în format Timestamp
+    $order_created_ts = strtotime($order->get_date_created()->date('Y-m-d H:i:s'));
+
+    if (empty($short_phone)) return;
+
+    $received = get_transient('sawp_received_sms');
+    if (!$received || !is_array($received)) return;
+
+    // Căutăm SMS-ul potrivit
+    $found_msg = null;
+    $min_diff = 172800; // Marjă de maxim 48 ore după comandă
+
+    foreach ($received as $sms) {
+        $sms_phone = preg_replace('/\D+/', '', sawp_extract_phone_raw($sms));
+        if (substr($sms_phone, -9) === $short_phone) {
+            $sms_ts = strtotime($sms['created_at']);
+            
+            // CONDIȚIE: SMS-ul trebuie să fi venit DUPĂ comandă
+            if ($sms_ts >= $order_created_ts) {
+                $diff = $sms_ts - $order_created_ts;
+                
+                // Îl luăm pe cel mai apropiat de momentul comenzii (primul răspuns)
+                if ($diff < $min_diff) {
+                    $min_diff = $diff;
+                    $found_msg = $sms;
+                }
+            }
+        }
+    }
+
+    if ($found_msg) {
+        $msg = sawp_extract_message($found_msg);
+        $time = date('d.m H:i', strtotime($found_msg['created_at']));
+        
+        // Stil diferit pentru DA vs Ref
+        $color = (stripos($msg, 'DA') !== false) ? '#2e7d32' : '#2e7d32';
+        $bg = (stripos($msg, 'DA') !== false) ? '#fff' : '#fff';
+
+        echo '<div style="background:'.$bg.'; border-left:4px solid '.$color.'; padding:5px 8px; border-radius:4px;">';
+        echo '<strong style="color:'.$color.'; font-size:13px;">' . esc_html($msg) . '</strong>';
+        echo '<div style="font-size:9px; color:#666; margin-top:2px;">Primit: ' . $time . '</div>';
+        echo '</div>';
+    } else {
+        echo '<span style="color:#ddd;">—</span>';
+    }
+}
+
+/**************************************************
+ * FIX PRO JS - BADGE-URI SMS (DOAR ÎN TABEL)
+ **************************************************/
+
+add_action('admin_footer', 'sawp_fix_badges_pro_js');
+function sawp_fix_badges_pro_js() {
+    $screen = get_current_screen();
+    if ( ! $screen || !in_array($screen->id, ['edit-shop_order', 'woocommerce_page_wc-orders'])) return;
+    ?>
+    <script>
+    (function($) {
+        function updateSmsBadges() {
+            // Selectăm DOAR celulele din corpul tabelului (tbody), evitând antetul (thead)
+            $('tbody .column-sawp_sms_resp, tbody .column-sms_last_resp, tbody [data-colname="Răspuns SMS"]').each(function() {
+                var $cell = $(this);
+                
+                // Extragem textul principal (Da, Dah, Ref etc.)
+                var rawText = $cell.find('strong').first().text().trim() || $cell.text().trim();
+                // Curățăm textul: doar litere mari, fără spații/simboluri
+                var cleanText = rawText.split('\n')[0].toUpperCase().replace(/[^A-Z]/g, '');
+
+                if (cleanText === "" || $cell.text().includes('—')) return;
+
+                // Configurare Badge Implicit (NECLAR)
+                var badgeText = "⚠ NECLAR";
+                var style = "background:#fff3cd; color:#856404; border:1px solid #ffeeba;";
+
+                // Logica VERDE (DA / DAH / OK)
+                if (['DA', 'da', 'OK', 'APROB'].includes(cleanText)) {
+                    badgeText = "✓ APROBAT";
+                    style = "background:#c6e1c6; color:#1e4620; border:1px solid #5b845d;";
+                } 
+                // Logica ROȘU (REF / NU)
+                else if (['nu', 'REFUZ', 'NU', 'ANULEZ'].includes(cleanText)) {
+                    badgeText = "✕ ANULAT";
+                    style = "background:#f8d7da; color:#721c24; border:1px solid #f5c6cb;";
+                }
+
+                // Eliminăm duplicatele
+                $cell.find('.sms-status-pill').remove();
+
+                // Injectăm Badge-ul stilizat
+                var html = '<div class="sms-status-pill" style="' + style + 
+                    ' padding:2px 10px; border-radius:20px; font-weight:700; font-size:9px; ' +
+                    ' margin-bottom:8px; display:inline-flex; align-items:center; line-height:1.4; ' +
+                    ' letter-spacing:0.5px; text-transform:uppercase; box-shadow:0 1px 2px rgba(0,0,0,0.05);">' + 
+                    badgeText + '</div>';
+                
+                // Îl punem la începutul celulei
+                $cell.prepend(html);
+            });
+        }
+
+        $(document).ready(updateSmsBadges);
+        $(document).ajaxComplete(updateSmsBadges);
+    })(jQuery);
+    </script>
+    <style>
+        /* Ajustări fine de layout */
+        .column-sawp_sms_resp, .column-sms_last_resp { vertical-align: middle !important; }
+        .sms-status-pill { cursor: default; user-select: none; }
+    </style>
+    <?php
+}
+
+
+
+//
+/**
+ * 1. Adaugă coloana "Sameday" în lista de comenzi (HPOS & Clasic)
+ */
+add_filter( 'manage_edit-shop_order_columns', 'sawp_add_sameday_column' );
+add_filter( 'manage_woocommerce_page_wc-orders_columns', 'sawp_add_sameday_column' );
+function sawp_add_sameday_column( $columns ) {
+    $columns['sawp_sameday_action'] = 'Sameday AWB';
+    return $columns;
+}
+
+/**
+ * 2. Afișează butonul roșu sau AWB-ul detectat (care merge în {awb})
+ */
+add_action( 'manage_shop_order_posts_custom_column', 'sawp_fill_sameday_column', 10, 2 );
+add_action( 'manage_woocommerce_page_wc-orders_custom_column', 'sawp_fill_sameday_column', 10, 2 );
+function sawp_fill_sameday_column( $column, $order ) {
+    if ( $column === 'sawp_sameday_action' ) {
+        if ( is_numeric( $order ) ) { $order = wc_get_order( $order ); }
+        
+        $order_id = $order->get_id();
+        // Verificăm cheia folosită de Notice pentru variabila {awb}
+        $awb = $order->get_meta('_notice_awb');
+
+        if ( ! empty( $awb ) ) {
+            // Dacă AWB-ul există deja în variabila {awb}, îl afișăm verde
+            echo '<div style="color: #46b450; font-weight: bold; font-size: 13px;">';
+            echo '<span class="dashicons dashicons-external" style="font-size: 16px; margin-top:2px;"></span> ' . esc_html( $awb );
+            echo '</div>';
+        } else {
+            // Butonul ROȘU dacă {awb} este încă gol
+            echo '<a href="' . admin_url('post.php?post=' . $order_id . '&action=edit&sameday_open=true') . '" 
+                    class="button sawp-sameday-btn" 
+                    style="background-color: #e60000 !important; color: white !important; border: none; font-weight: bold; text-transform: uppercase; padding: 0 10px; border-radius: 4px;">
+                    Sameday
+                  </a>';
+        }
+    }
+}
+
+/**
+ * 3. Script pentru deschiderea automată a ferestrei de generare AWB
+ */
+add_action( 'admin_footer', 'sawp_sameday_auto_open_script' );
+function sawp_sameday_auto_open_script() {
+    // Verificăm dacă suntem în pagina de editare a unei comenzi și avem parametrul de open
+    if ( ! isset($_GET['sameday_open']) || $_GET['sameday_open'] !== 'true' ) return;
+
+    ?>
+    <script>
+    jQuery(document).ready(function($) {
+        // Căutăm butoanele specifice pluginului Sameday (clasele/ID-urile cele mai comune)
+        var $samedayBtn = $('.sameday-generate-awb, #sameday_create_awb, .sameday_create_awb_btn');
+        
+        if ($samedayBtn.length > 0) {
+            console.log('Notice: Deschid fereastra Sameday...');
+            setTimeout(function() {
+                $samedayBtn.first().click();
+            }, 800); // Mică întârziere pentru a lăsa pluginul Sameday să se încarce
+        }
+    });
+    </script>
+    <?php
+}
+
+/**
+ * 4. Ajustare stil coloană
+ */
+add_action('admin_head', function() {
+    echo '<style>.column-sawp_sameday_action { width: 140px; text-align: center !important; }</style>';
+});
+
+//
+ 
+
+ /**
+ * 1. Adaugă coloana "FAN Courier" în lista de comenzi (HPOS & Clasic)
+ */
+add_filter( 'manage_edit-shop_order_columns', 'sawp_add_fan_column_only' );
+add_filter( 'manage_woocommerce_page_wc-orders_columns', 'sawp_add_fan_column_only' );
+function sawp_add_fan_column_only( $columns ) {
+    $columns['sawp_fan_action'] = 'FAN AWB ';
+    return $columns;
+}
+
+/**
+ * 2. Afișează AWB-ul (dacă e de FAN) sau butonul de generare
+ */
+add_action( 'manage_shop_order_posts_custom_column', 'sawp_fill_fan_column_only', 10, 2 );
+add_action( 'manage_woocommerce_page_wc-orders_custom_column', 'sawp_fill_fan_column_only', 10, 2 );
+function sawp_fill_fan_column_only( $column, $order ) {
+    if ( $column === 'sawp_fan_action' ) {
+        if ( is_numeric( $order ) ) { $order = wc_get_order( $order ); }
+        $order_id = $order->get_id();
+        
+        // Luăm valoarea care se duce în {awb}
+        $awb_value = trim((string)$order->get_meta('_notice_awb'));
+
+        /**
+         * Verificăm dacă AWB-ul aparține FAN Courier.
+         * Verificăm meta-cheile standard folosite de pluginul FAN oficial și extensiile Woo.
+         */
+        $is_real_fan = $order->get_meta('fan_awb_number') || 
+                       $order->get_meta('_fan_awb_number') || 
+                       $order->get_meta('fan_awb') ||
+                       (is_numeric($awb_value) && strlen($awb_value) >= 6 && strlen($awb_value) <= 11);
+
+        if ( !empty($awb_value) && $is_real_fan ) {
+            // Afișăm AWB-ul cu stilul FAN Courier (albastru)
+            echo '<div style="color: #0054a6; font-weight: bold; font-size: 13px; text-align: center;">';
+            echo '<span class="dashicons dashicons-yes" style="font-size: 18px; margin-right: 4px; vertical-align: middle;"></span>' . esc_html( $awb_value );
+            echo '</div>';
+        } else {
+            // Butonul ALBASTRU pentru FAN Courier
+            // Adăugăm un parametru în URL pentru a știi să deschidem automat interfața FAN
+            $url = admin_url('post.php?post=' . $order_id . '&action=edit&notice_open_fan=true');
+            if (isset($_GET['page']) && $_GET['page'] == 'wc-orders') {
+                $url = admin_url('admin.php?page=wc-orders&action=edit&id=' . $order_id . '&notice_open_fan=true');
+            }
+
+            echo '<a href="' . esc_url($url) . '" 
+                    class="button" 
+                    style="background-color: #0054a6 !important; color: #fff !important; border: none; font-weight: bold; text-transform: uppercase; padding: 0 12px; border-radius: 4px; display: block; text-align: center;">
+                    FAN 
+                  </a>';
+        }
+    }
+}
+
+/**
+ * 3. Script pentru deschiderea automată a ferestrei de generare FAN Courier
+ */
+add_action( 'admin_footer', 'sawp_fan_auto_click_script' );
+function sawp_fan_auto_click_script() {
+    if ( ! isset($_GET['notice_open_fan']) || $_GET['notice_open_fan'] !== 'true' ) return;
+    ?>
+    <script>
+    jQuery(document).ready(function($) {
+        // Încercăm să găsim butoanele de generare AWB ale pluginului FAN
+        var $btnFan = $('#fan_print_awb_btn, #fan_generate_awb, .fan_generate_awb, a[href*="generate_fan_awb"], #generate_awb_fan, .button.generate-fan-awb');
+        
+        if ($btnFan.length > 0) {
+            console.log('Notice: Deschid automat generarea FAN Courier...');
+            setTimeout(function() {
+                $btnFan.first().click();
+            }, 1200); // Întârziere pentru a permite încărcarea completă a datelor FAN
+        } else {
+            // Dacă pluginul FAN e ascuns într-un tab lateral
+            var $tabFan = $('a[href="#fan_courier_data"], .fan-courier-tab-link');
+            if($tabFan.length > 0) $tabFan.click();
+        }
+    });
+    </script>
+    <?php
+}
+
+/**
+ * 4. CSS pentru coloană
+ */
+add_action('admin_head', function() {
+    echo '<style>
+        .column-sawp_fan_action { width: 140px; text-align: center !important; vertical-align: middle !important; }
+        .column-sawp_fan_action .button:hover { background-color: #003d7a !important; color: #fff !important; }
+    </style>';
+});
+
+
+?>
