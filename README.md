@@ -1,8 +1,8 @@
-# Notice.ro - WooCommerce SMS Connector
+# NoticeApp
 
 ---
 
-**Notice.ro** este un plugin pentru WordPress/WooCommerce care trimite automat SMS-uri la schimbarea statusului unei comenzi, folosind template-urile predefinite din platforma [www.notice.ro](https://www.notice.ro).
+**NoticeApp** este un plugin pentru WordPress/WooCommerce care trimite automat SMS-uri la schimbarea statusului unei comenzi, folosind template-urile predefinite din platforma [www.notice.ro](https://www.notice.ro).
 
 ---
 
